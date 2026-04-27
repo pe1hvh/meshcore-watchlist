@@ -1,0 +1,30 @@
+[Unit]
+Description=meshcore-watchlist — local hashtag-channel monitor for MeshCore
+After=network.target
+
+[Service]
+Type=simple
+User=@USER@
+Group=@USER@
+WorkingDirectory=@INSTALL_DIR@
+
+Environment="MESHCORE_WATCHLIST_PORT=@PORT@"
+Environment="MESHCORE_WATCHLIST_HOST=0.0.0.0"
+
+ExecStart=@INSTALL_DIR@/.venv/bin/python -m meshcore_watchlist.main
+
+Restart=on-failure
+RestartSec=5
+
+# Hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+# Leading '-' makes systemd tolerate the path being absent at start-up;
+# the install script creates it, but this prevents namespace failure if
+# the directory is ever removed manually.
+ReadWritePaths=-/home/@USER@/.meshcore-watchlist
+
+[Install]
+WantedBy=multi-user.target

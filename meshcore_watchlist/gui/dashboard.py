@@ -57,6 +57,22 @@ def _render_index(shared: SharedData, store: WatchlistStore) -> None:
         with ui.tab_panel(tab_rxlog):
             rx_table = _build_rxlog_panel()
 
+    # Initial render — populate every table from the current snapshot
+    # before the timer starts.  Required because SharedData's *_updated
+    # flags are process-global: an earlier browser session may already
+    # have ticked and cleared them, leaving freshly-mounted tables empty
+    # until the next mutation flips a flag back on.  Each new page
+    # session must therefore prime its own tables explicitly.
+    initial = shared.get_snapshot()
+    wl_table.rows = [
+        {"idx": c["idx"], "name": c["name"]} for c in initial["channels"]
+    ]
+    wl_table.update()
+    msg_table.rows = [_msg_to_row(m) for m in reversed(initial["messages"])][:200]
+    msg_table.update()
+    rx_table.rows = [_rx_to_row(r) for r in reversed(initial["rx_log"])][:50]
+    rx_table.update()
+
     # Render loop — refresh every second while the page is open.
     def _refresh() -> None:
         snap = shared.get_snapshot()

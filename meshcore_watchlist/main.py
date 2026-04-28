@@ -36,6 +36,10 @@ from meshcore_watchlist.core.models import Message, RxLogEntry
 from meshcore_watchlist.core.shared_data import SharedData
 from meshcore_watchlist.decoder.packet_decoder import PacketDecoder
 from meshcore_watchlist.gui.dashboard import build_dashboard
+from meshcore_watchlist.services.archive_rescanner import (
+    ArchiveRescanner,
+    RescanJobManager,
+)
 from meshcore_watchlist.services.jsonl_tailer import JsonlTailer
 from meshcore_watchlist.services.watchlist_store import WatchlistStore
 
@@ -159,11 +163,17 @@ def main() -> None:
     tailer = JsonlTailer(callback=pipeline.handle_entry)
     tailer.start()
 
+    # Rescanner: runs on demand via the REST endpoint or the GUI
+    # button.  Independent of the live tailer — does not touch
+    # state.json cursors.
+    rescanner = ArchiveRescanner(shared=shared, decoder=decoder, store=store)
+    rescan_manager = RescanJobManager(rescanner)
+
     # GUI
-    build_dashboard(shared=shared, store=store)
+    build_dashboard(shared=shared, store=store, rescan_manager=rescan_manager)
 
     # Public REST API (/api/v1/...)
-    register_routes(shared)
+    register_routes(shared, rescan_manager=rescan_manager)
 
     # NiceGUI run.  ``reload=False`` because we manage long-lived
     # background threads (the tailer) and reload would orphan them.

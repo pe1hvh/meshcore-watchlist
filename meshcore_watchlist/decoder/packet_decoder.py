@@ -152,7 +152,11 @@ class PacketDecoder:
     # Decode
     # ------------------------------------------------------------------
 
-    def decode(self, payload_hex: str) -> Optional[DecodedPacket]:
+    def decode(
+        self,
+        payload_hex: str,
+        allowed_idx: Optional[int] = None,
+    ) -> Optional[DecodedPacket]:
         """Decode a raw LoRa packet hex string.
 
         Two-phase approach:
@@ -169,6 +173,13 @@ class PacketDecoder:
         Args:
             payload_hex: Hex string from the RX_LOG_DATA event's
                          ``payload`` field.
+            allowed_idx: If given, only attempt decryption with the key
+                         registered for that channel index.  All other
+                         registered keys are skipped.  Used by the rescan
+                         endpoint ``POST /api/v1/rescan/{idx}`` to scope
+                         a retroactive decode pass to a single channel.
+                         ``None`` (default) attempts every registered key
+                         — matches pre-0.2.0 behaviour.
 
         Returns:
             :class:`DecodedPacket` on success, ``None`` if the data
@@ -198,6 +209,8 @@ class PacketDecoder:
         # ── Phase 2: per-key decryption (GroupText only) ──────────────
         if packet.payload_type == PayloadType.GroupText and self._secret_to_idx:
             for secret_hex, idx in self._secret_to_idx.items():
+                if allowed_idx is not None and idx != allowed_idx:
+                    continue
                 try:
                     ks = MeshCoreKeyStore()
                     ks.add_channel_secrets([secret_hex])

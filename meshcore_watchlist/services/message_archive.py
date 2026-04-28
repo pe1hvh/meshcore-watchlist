@@ -542,6 +542,78 @@ class MessageArchive:
                 "pending_rxlog": len(self._rxlog_buffer),
             }
 
+    # ------------------------------------------------------------------
+    # Full-archive dedup loaders (used by the rescan job)
+    # ------------------------------------------------------------------
+
+    def load_all_rxlog_hashes(self) -> set:
+        """Return the set of every ``message_hash`` already in the archive.
+
+        Used by :class:`ArchiveRescanner` to suppress duplicate RX log
+        writes when rerunning over historical ``*_rxlog.jsonl`` files.
+        SharedData's in-memory ``_rxlog_hashes`` set is populated from
+        only the last :data:`SharedData.MAX_RX_LOG` archive entries on
+        startup, so it is unsuitable for archive-wide dedup.
+
+        Empty hashes are excluded.
+
+        Returns:
+            ``set[str]`` of hex message-hash strings.
+        """
+        with self._lock:
+            self._flush_rxlog()
+            if not self._rxlog_path.exists():
+                return set()
+            try:
+                data = json.loads(self._rxlog_path.read_text(encoding="utf-8"))
+                if data.get("version") != ARCHIVE_VERSION:
+                    return set()
+                return {
+                    e.get("message_hash", "")
+                    for e in data.get("entries", [])
+                    if e.get("message_hash")
+                }
+            except (json.JSONDecodeError, OSError) as exc:
+                debug_print(
+                    f"Archive: error loading rxlog hashes: {exc}"
+                )
+                return set()
+
+    def load_all_message_fingerprints(self) -> set:
+        """Return the set of fingerprints for every archived message.
+
+        Each fingerprint is a 4-tuple ``(message_hash, sender, text,
+        channel)`` matching :meth:`SharedData.add_message`'s in-memory
+        dedup tuple.  Used by :class:`ArchiveRescanner` to recognise
+        messages that have already been emitted on a previous decode
+        pass.  Loaded once at the start of a rescan job.
+
+        Returns:
+            ``set[tuple]`` of fingerprint tuples.
+        """
+        with self._lock:
+            self._flush_messages()
+            if not self._messages_path.exists():
+                return set()
+            try:
+                data = json.loads(self._messages_path.read_text(encoding="utf-8"))
+                if data.get("version") != ARCHIVE_VERSION:
+                    return set()
+                return {
+                    (
+                        m.get("message_hash", "") or "",
+                        m.get("sender", ""),
+                        m.get("text", ""),
+                        m.get("channel"),
+                    )
+                    for m in data.get("messages", [])
+                }
+            except (json.JSONDecodeError, OSError) as exc:
+                debug_print(
+                    f"Archive: error loading message fingerprints: {exc}"
+                )
+                return set()
+
     def get_messages_by_sender_pubkey(
         self, pubkey_prefix: str, limit: int = 50,
     ) -> List[Dict]:

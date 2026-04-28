@@ -2,38 +2,51 @@
 NiceGUI dashboard for meshcore-watchlist.
 
 Three tabs:
-    * Watchlist  — CRUD over watchlist.json (channel_panel)
+    * Watchlist  — CRUD over watchlist.json (channel_panel) + rescan
     * Messages   — decoded GroupText messages, optionally filtered
     * RX Log     — every raw packet seen on the air
 
 Read-only with respect to the radio (no TX).  Writes only happen
-to the local watchlist.json via WatchlistStore.
+to the local watchlist.json via WatchlistStore, and to the message /
+rxlog archive via the rescan job (when triggered).
 """
 
 from __future__ import annotations
 
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, TYPE_CHECKING
 
 from nicegui import ui
 
-from meshcore_watchlist.config import VERSION
+from meshcore_watchlist.config import VERSION, debug_print
 from meshcore_watchlist.core.shared_data import SharedData
+from meshcore_watchlist.services.archive_rescanner import RescanBusyError
 from meshcore_watchlist.services.watchlist_store import WatchlistStore
 
+if TYPE_CHECKING:
+    from meshcore_watchlist.services.archive_rescanner import RescanJobManager
 
-def build_dashboard(shared: SharedData, store: WatchlistStore) -> None:
+
+def build_dashboard(
+    shared: SharedData,
+    store: WatchlistStore,
+    rescan_manager: "RescanJobManager",
+) -> None:
     """Mount the dashboard UI on the root NiceGUI page."""
 
     @ui.page("/")
     def index() -> None:
-        _render_index(shared, store)
+        _render_index(shared, store, rescan_manager)
 
 
 # ---------------------------------------------------------------------------
 # Page rendering
 # ---------------------------------------------------------------------------
 
-def _render_index(shared: SharedData, store: WatchlistStore) -> None:
+def _render_index(
+    shared: SharedData,
+    store: WatchlistStore,
+    rescan_manager: "RescanJobManager",
+) -> None:
     ui.add_head_html(
         "<style>body{background:#101418;color:#e0e0e0;font-family:sans-serif;}</style>"
     )
@@ -49,7 +62,7 @@ def _render_index(shared: SharedData, store: WatchlistStore) -> None:
 
     with ui.tab_panels(tabs, value=tab_watchlist).classes("w-full"):
         with ui.tab_panel(tab_watchlist):
-            wl_table = _build_watchlist_panel(store)
+            wl_table = _build_watchlist_panel(store, rescan_manager)
 
         with ui.tab_panel(tab_messages):
             msg_table = _build_messages_panel()
@@ -101,8 +114,14 @@ def _render_index(shared: SharedData, store: WatchlistStore) -> None:
 # Tab panels
 # ---------------------------------------------------------------------------
 
-def _build_watchlist_panel(store: WatchlistStore):
-    """Watchlist CRUD: add hashtag, list, remove."""
+def _build_watchlist_panel(
+    store: WatchlistStore,
+    rescan_manager: "RescanJobManager",
+):
+    """Watchlist CRUD: add hashtag, list, remove — plus the rescan
+    archive trigger and a progress widget."""
+
+    # ── Add row ───────────────────────────────────────────────────────
     with ui.row().classes("w-full items-end gap-2"):
         name_input = ui.input(
             label="Hashtag channel",
@@ -119,6 +138,116 @@ def _build_watchlist_panel(store: WatchlistStore):
 
         ui.button("Add", icon="add", on_click=_on_add).props("color=primary")
 
+    # ── Rescan row + progress widget ─────────────────────────────────
+    # Per-page state: which job_id this browser session is watching.
+    # Stored as a single-element list so the closure can mutate it.
+    watched_job: List[Optional[str]] = [None]
+
+    with ui.row().classes("w-full items-center gap-2 q-mt-md"):
+        rescan_btn = ui.button(
+            "Rescan archive",
+            icon="refresh",
+        ).props("color=secondary")
+        progress_label = ui.label("").classes("text-sm opacity-75")
+        progress_bar = ui.linear_progress(value=0).classes("flex-grow")
+        progress_bar.visible = False
+
+    def _start_job(only_channel_idx: Optional[int], label: str) -> None:
+        """Submit a rescan job and wire the GUI to watch its progress.
+
+        Shared by the full-rescan button and the per-channel buttons
+        in the table action column.  *label* is a short human string
+        ("full archive", "#mc-radar") used in toast notifications.
+        """
+        try:
+            job = rescan_manager.submit(only_channel_idx=only_channel_idx)
+        except RescanBusyError as exc:
+            ui.notify(
+                f"Rescan already running (job {exc.running_job_id[:8]})",
+                color="warning",
+            )
+            # Even though we couldn't submit, attach the GUI to the
+            # already-running job so the progress bar shows reality.
+            watched_job[0] = exc.running_job_id
+            rescan_btn.disable()
+            progress_bar.visible = True
+            return
+        except Exception as exc:  # pragma: no cover - defensive
+            debug_print(f"GUI rescan submit error: {exc}")
+            ui.notify(f"Rescan failed to start: {exc}", color="negative")
+            return
+        ui.notify(
+            f"Rescanning {label} (job {job.job_id[:8]})",
+            color="positive",
+        )
+        watched_job[0] = job.job_id
+        rescan_btn.disable()
+        progress_bar.visible = True
+        progress_bar.value = 0
+        progress_label.text = f"starting ({label})…"
+
+    def _on_rescan() -> None:
+        _start_job(only_channel_idx=None, label="full archive")
+
+    rescan_btn.on("click", _on_rescan)
+
+    def _poll_progress() -> None:
+        """Tick once per second while a job is being watched.
+
+        Updates the progress bar and label, then re-enables the
+        button when the job reaches a terminal state.
+        """
+        jid = watched_job[0]
+        if jid is None:
+            return
+        job = rescan_manager.get(jid)
+        if job is None:
+            # Job evicted (very unlikely while running) — just clear.
+            watched_job[0] = None
+            rescan_btn.enable()
+            progress_bar.visible = False
+            progress_label.text = ""
+            return
+
+        d = job.to_dict()
+        prog = d["progress"]
+        counts = d["counts"]
+        total = prog["bytes_total"] or 1
+        progress_bar.value = prog["bytes_done"] / total
+        progress_label.text = (
+            f'{d["status"]} — {prog["bytes_done"]:,}/{prog["bytes_total"]:,} B '
+            f'({prog["percent"]}%) · '
+            f'+{counts["new_messages"]} msgs, '
+            f'+{counts["new_rxlog"]} rxlog, '
+            f'{counts["skipped_dup_rxlog"]} dup-skipped'
+        )
+
+        if d["status"] in ("done", "failed"):
+            watched_job[0] = None
+            rescan_btn.enable()
+            if d["status"] == "done":
+                ui.notify(
+                    f'Rescan done: +{counts["new_messages"]} new messages',
+                    color="positive",
+                )
+            else:
+                ui.notify(
+                    f'Rescan failed: {d.get("error") or "unknown error"}',
+                    color="negative",
+                )
+
+    ui.timer(1.0, _poll_progress)
+
+    # If a rescan was already running when this page mounted (e.g. the
+    # user opened a second browser tab mid-job), pick it up so the
+    # progress bar reflects reality rather than a stale "idle" state.
+    pre_existing = rescan_manager.running_job_id()
+    if pre_existing is not None:
+        watched_job[0] = pre_existing
+        rescan_btn.disable()
+        progress_bar.visible = True
+
+    # ── Channel table ────────────────────────────────────────────────
     columns = [
         {"name": "idx", "label": "Idx", "field": "idx", "align": "left"},
         {"name": "name", "label": "Name", "field": "name", "align": "left"},
@@ -126,12 +255,24 @@ def _build_watchlist_panel(store: WatchlistStore):
     ]
     table = ui.table(columns=columns, rows=[], row_key="idx").classes("w-full")
 
+    # Per-row action buttons:
+    #   refresh → rescan archive scoped to this channel only
+    #             (POST /api/v1/rescan/{idx} equivalent, in-process)
+    #   delete  → remove channel from watchlist
+    # The Quasar emits travel up to the parent table component, where
+    # the Python handlers below (table.on(...)) catch them.
     table.add_slot(
         "body-cell-actions",
         r"""
         <q-td :props="props">
+            <q-btn dense flat icon="refresh" color="primary"
+                   @click="$parent.$emit('rescan_channel', props.row)">
+                <q-tooltip>Rescan archive for this channel</q-tooltip>
+            </q-btn>
             <q-btn dense flat icon="delete" color="negative"
-                   @click="$parent.$emit('remove', props.row)" />
+                   @click="$parent.$emit('remove', props.row)">
+                <q-tooltip>Remove channel from watchlist</q-tooltip>
+            </q-btn>
         </q-td>
         """,
     )
@@ -141,7 +282,15 @@ def _build_watchlist_panel(store: WatchlistStore):
         if idx is not None and store.remove(int(idx)):
             ui.notify("Removed", color="positive")
 
+    def _on_rescan_channel(e) -> None:
+        idx = e.args.get("idx")
+        name = e.args.get("name") or f"ch{idx}"
+        if idx is None:
+            return
+        _start_job(only_channel_idx=int(idx), label=name)
+
     table.on("remove", _on_remove)
+    table.on("rescan_channel", _on_rescan_channel)
     return table
 
 

@@ -164,6 +164,117 @@ class SharedData:
         return None
 
     # ------------------------------------------------------------------
+    # Rescan support
+    # ------------------------------------------------------------------
+
+    def ingest_rescanned_rxlog(
+        self,
+        entry: RxLogEntry,
+        archive_rxlog_hashes: set,
+    ) -> bool:
+        """Persist an rxlog entry from the rescan job, deduped against
+        the **full archive** rather than the 50-entry in-memory ring.
+
+        SharedData's normal :meth:`add_rx_log` deduplicates against
+        ``_rxlog_hashes``, which is seeded from only the most recent
+        :data:`MAX_RX_LOG` archive entries at startup.  That window
+        is too small to suppress duplicates when a rescan reprocesses
+        days of history, so the rescan job loads the full archive hash
+        set up-front and passes it in here.
+
+        The in-memory ring buffer is **not** updated — the "live"
+        Messages and RX Log tabs should keep showing recent traffic,
+        not get flooded with re-ingested historical entries.  Callers
+        that want the in-memory caches to reflect new archive contents
+        should call :meth:`reload_caches_from_archive` once, after the
+        whole rescan job finishes.
+
+        Args:
+            entry: RxLogEntry built from the historical JSONL line.
+            archive_rxlog_hashes: Set of message_hash strings already
+                in the archive at the start of the rescan job.  This
+                method **mutates** the set: newly persisted hashes are
+                added so subsequent duplicates within the same job are
+                also suppressed.
+
+        Returns:
+            ``True`` if the entry was new and persisted, ``False`` if
+            it was a duplicate of an already-archived entry.
+        """
+        if entry.message_hash and entry.message_hash in archive_rxlog_hashes:
+            return False
+        if entry.message_hash:
+            archive_rxlog_hashes.add(entry.message_hash)
+        if self.archive:
+            self.archive.add_rx_log(entry)
+        return True
+
+    def ingest_rescanned_message(
+        self,
+        msg: Message,
+        archive_message_fps: set,
+    ) -> bool:
+        """Persist a Message from the rescan job, deduped against the
+        full archive fingerprint set.
+
+        See :meth:`ingest_rescanned_rxlog` for the rationale.  The
+        archive fingerprint set is mutated in place.
+
+        Args:
+            msg: Message dataclass instance.
+            archive_message_fps: Set of ``(hash, sender, text, channel)``
+                tuples already in the archive at the start of the rescan
+                job.
+
+        Returns:
+            ``True`` if the message was new and persisted, ``False`` if
+            it was a duplicate.
+        """
+        fp = (
+            msg.message_hash or "",
+            msg.sender,
+            msg.text,
+            msg.channel,
+        )
+        if fp in archive_message_fps:
+            return False
+        archive_message_fps.add(fp)
+        if self.archive:
+            self.archive.add_message(msg)
+        return True
+
+    def reload_caches_from_archive(self) -> None:
+        """Clear the in-memory rings and re-populate them from the
+        on-disk archive.
+
+        Called once at the end of a rescan job so the dashboard's
+        Messages tab reflects messages that were freshly decoded
+        from historical packets.  Sets ``messages_updated`` and
+        ``rxlog_updated`` so the next render-loop tick picks the
+        new state up.
+
+        Also flushes the archive's pending write buffers first so any
+        rescan output that was still in memory makes it to disk before
+        being read back.
+        """
+        if self.archive:
+            self.archive.flush()
+        with self.lock:
+            self.messages.clear()
+            self.rx_log.clear()
+            self._message_fingerprints.clear()
+            self._rxlog_hashes.clear()
+        # _load_from_archive acquires no lock itself (it appends only
+        # during initial construction or here) but operates on the same
+        # collections.  We hold no lock during the read so concurrent
+        # add_message/add_rx_log from the live tailer is still possible;
+        # a brief race would at worst show a duplicate row for one tick.
+        self._load_from_archive()
+        with self.lock:
+            self.messages_updated = True
+            self.rxlog_updated = True
+
+    # ------------------------------------------------------------------
     # Internal
     # ------------------------------------------------------------------
 

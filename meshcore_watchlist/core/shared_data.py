@@ -171,6 +171,7 @@ class SharedData:
         self,
         entry: RxLogEntry,
         archive_rxlog_hashes: set,
+        timestamp_utc: Optional[str] = None,
     ) -> bool:
         """Persist an rxlog entry from the rescan job, deduped against
         the **full archive** rather than the 50-entry in-memory ring.
@@ -196,6 +197,13 @@ class SharedData:
                 method **mutates** the set: newly persisted hashes are
                 added so subsequent duplicates within the same job are
                 also suppressed.
+            timestamp_utc: ISO-8601 UTC timestamp to record on the
+                archive row.  Should be the **original** packet
+                arrival time (derived from the rxlog source by the
+                rescanner), not the moment the rescan happens to be
+                running, otherwise downstream consumers that sort or
+                filter by ``timestamp_utc`` see all rescanned rows
+                clustered at the rescan moment.
 
         Returns:
             ``True`` if the entry was new and persisted, ``False`` if
@@ -206,13 +214,14 @@ class SharedData:
         if entry.message_hash:
             archive_rxlog_hashes.add(entry.message_hash)
         if self.archive:
-            self.archive.add_rx_log(entry)
+            self.archive.add_rx_log(entry, timestamp_utc=timestamp_utc)
         return True
 
     def ingest_rescanned_message(
         self,
         msg: Message,
         archive_message_fps: set,
+        timestamp_utc: Optional[str] = None,
     ) -> bool:
         """Persist a Message from the rescan job, deduped against the
         full archive fingerprint set.
@@ -225,6 +234,9 @@ class SharedData:
             archive_message_fps: Set of ``(hash, sender, text, channel)``
                 tuples already in the archive at the start of the rescan
                 job.
+            timestamp_utc: ISO-8601 UTC timestamp to record on the
+                archive row.  Should be the original packet arrival
+                time.  See :meth:`ingest_rescanned_rxlog`.
 
         Returns:
             ``True`` if the message was new and persisted, ``False`` if
@@ -240,7 +252,7 @@ class SharedData:
             return False
         archive_message_fps.add(fp)
         if self.archive:
-            self.archive.add_message(msg)
+            self.archive.add_message(msg, timestamp_utc=timestamp_utc)
         return True
 
     def reload_caches_from_archive(self) -> None:

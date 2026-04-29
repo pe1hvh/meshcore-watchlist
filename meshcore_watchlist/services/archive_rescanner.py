@@ -36,6 +36,7 @@ Design constraints
 from __future__ import annotations
 
 import json
+import re
 import threading
 import uuid
 from dataclasses import dataclass, field
@@ -54,6 +55,112 @@ if TYPE_CHECKING:
     from meshcore_watchlist.core.shared_data import SharedData
     from meshcore_watchlist.decoder.packet_decoder import PacketDecoder
     from meshcore_watchlist.services.watchlist_store import WatchlistStore
+
+
+# ---------------------------------------------------------------------------
+# Timestamp recovery for historical records
+# ---------------------------------------------------------------------------
+#
+# The live tail stamps ``timestamp_utc = datetime.now()`` at the moment of
+# ingest, which is approximately correct because "now" ≈ the packet's
+# arrival time.  For historical replay that is catastrophically wrong: it
+# clusters every rescanned row at the rescan moment, breaking
+# timestamp-based sorts, time-window filters, and any downstream consumer
+# that uses ``timestamp_utc`` as a cursor (the message archive's
+# ``query_messages`` sorts by it; the public REST API exposes it; the
+# Stats endpoint windows on it).
+#
+# We try, in order of confidence, to recover the original arrival time:
+#
+#   1. The JSONL record itself.  If meshcore-gui already writes a
+#      ``timestamp_utc`` (or any other ISO-8601 field), use it verbatim.
+#   2. The record's ``time`` field combined with a date extracted from
+#      the rxlog filename.  Common pattern: ``YYYY-MM-DD_*_rxlog.jsonl``
+#      or any embedded ``YYYY-MM-DD`` / ``YYYYMMDD`` substring.
+#   3. The file's mtime — wrong by at most one retention window, but at
+#      least same-day-correct rather than cluster-on-rescan.
+#   4. ``now()`` as the absolute last resort, with a debug log so we can
+#      tell from the logs that the heuristic failed.
+
+_DATE_RE = re.compile(r"(20\d{2})[-_]?(\d{2})[-_]?(\d{2})")
+
+
+def _try_iso(value: object) -> Optional[str]:
+    """Return ``value`` if it parses as ISO-8601, else ``None``."""
+    if not isinstance(value, str) or not value:
+        return None
+    candidate = value.replace("Z", "+00:00")
+    try:
+        datetime.fromisoformat(candidate)
+        return value
+    except ValueError:
+        return None
+
+
+def _extract_date_from_filename(name: str) -> Optional[str]:
+    """Return ``YYYY-MM-DD`` if found in *name*, else ``None``."""
+    m = _DATE_RE.search(name)
+    if not m:
+        return None
+    y, mo, d = m.groups()
+    return f"{y}-{mo}-{d}"
+
+
+def _looks_like_hms(value: object) -> bool:
+    """Cheap check for ``HH:MM:SS`` (no date)."""
+    return (
+        isinstance(value, str)
+        and len(value) <= 12
+        and value.count(":") == 2
+        and "T" not in value
+        and "-" not in value
+    )
+
+
+def derive_record_timestamp_utc(rec: Dict, file_path: Path) -> str:
+    """Best-effort recovery of a record's original UTC arrival time.
+
+    See the module-level comment for the priority order.  Always
+    returns a non-empty ISO-8601 string — never raises, never
+    returns ``None``.  Falls back loudly (debug log) before resorting
+    to ``now()``.
+    """
+    # 1. Direct ISO timestamp on the record.
+    for field_name in ("timestamp_utc", "timestamp", "received_at", "ts"):
+        iso = _try_iso(rec.get(field_name))
+        if iso is not None:
+            return iso
+
+    # 2. Date from filename + HH:MM:SS from record's ``time`` field.
+    time_field = rec.get("time", "")
+    if _looks_like_hms(time_field):
+        date_part = _extract_date_from_filename(file_path.name)
+        if date_part:
+            try:
+                dt = datetime.fromisoformat(f"{date_part}T{time_field}")
+                # Treat the wall-clock time as UTC.  meshcore-gui's rxlog
+                # files don't carry an explicit timezone; the convention
+                # in the rest of this codebase (live tail's now() also
+                # uses UTC) is that the wall clock is UTC.
+                return dt.replace(tzinfo=timezone.utc).isoformat()
+            except ValueError:
+                pass
+
+    # 3. File mtime.  Same-day-correct in the common case where
+    #    rxlog files rotate daily.
+    try:
+        mtime = file_path.stat().st_mtime
+        return datetime.fromtimestamp(mtime, tz=timezone.utc).isoformat()
+    except OSError:
+        pass
+
+    # 4. Last resort.  Loud about it.
+    debug_print(
+        f"ArchiveRescanner: could not recover timestamp for record in "
+        f"{file_path.name}; falling back to now() — historical sort "
+        f"order will be wrong for this row."
+    )
+    return datetime.now(timezone.utc).isoformat()
 
 
 # ---------------------------------------------------------------------------
@@ -436,6 +543,7 @@ class ArchiveRescanner:
 
                 self._handle_line(
                     rec,
+                    path,
                     job,
                     channel_name_by_idx,
                     rxlog_hashes,
@@ -454,6 +562,7 @@ class ArchiveRescanner:
     def _handle_line(
         self,
         rec: Dict,
+        file_path: Path,
         job: RescanJob,
         channel_name_by_idx: Dict[int, str],
         rxlog_hashes: set,
@@ -464,8 +573,17 @@ class ArchiveRescanner:
         Mirrors :meth:`PacketPipeline.handle_entry` but routes through
         the rescan-aware ingest methods so dedup is performed against
         the archive-wide sets rather than the small in-memory rings.
+
+        Crucially, the original arrival timestamp is recovered from
+        the record / filename / mtime via :func:`derive_record_timestamp_utc`
+        and passed through to the ingest methods so the archive row
+        carries the historical time, not the rescan moment.
         """
         raw_payload = rec.get("raw_payload") or ""
+
+        # Recover the original arrival time once per record and reuse
+        # it for both the rxlog and the message rows so they line up.
+        ts_utc = derive_record_timestamp_utc(rec, file_path)
 
         rx_entry = RxLogEntry(
             time=rec.get("time", ""),
@@ -485,7 +603,9 @@ class ArchiveRescanner:
             packet_type_num=int(rec.get("packet_type_num", -1) or -1),
         )
 
-        if self._shared.ingest_rescanned_rxlog(rx_entry, rxlog_hashes):
+        if self._shared.ingest_rescanned_rxlog(
+            rx_entry, rxlog_hashes, timestamp_utc=ts_utc,
+        ):
             job.new_rxlog += 1
         else:
             job.skipped_dup_rxlog += 1
@@ -522,5 +642,7 @@ class ArchiveRescanner:
         if ch_name:
             msg.channel_name = ch_name
 
-        if self._shared.ingest_rescanned_message(msg, message_fps):
+        if self._shared.ingest_rescanned_message(
+            msg, message_fps, timestamp_utc=ts_utc,
+        ):
             job.new_messages += 1

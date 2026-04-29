@@ -3,17 +3,34 @@ Watchlist store — persistent CRUD over ``~/.meshcore-watchlist/watchlist.json`
 
 The file format mirrors meshcore-gui's device channel list so the same
 UI structure can be reused.  Each entry has a stable ``idx`` (= position
-in the list) and a ``name`` (the hashtag including the leading ``#``).
-The decryption key is derived deterministically from the name via
-``SHA-256(name)[:16]`` and is therefore not stored.
+in the list) and a ``name``.
+
+Channel kinds:
+
+* **Public** — single, system-managed entry.  Always present, always
+  at ``idx == 0``, name always equal to
+  :data:`meshcore_watchlist.config.PUBLIC_CHANNEL_CANONICAL_NAME`.
+  Cannot be added (already there) or removed (rejected).  This
+  matches meshcore-gui's device behaviour: the firmware reserves
+  channel slot 0 for Public.
+* **Hashtag** — user-managed.  Names are forced to start with ``#``
+  and the decryption key is derived deterministically as
+  ``SHA-256(name)[:16]``.
+
+The Public-channel decryption key is **not** derived from its name —
+it is a fixed well-known 16-byte secret defined in
+:data:`meshcore_watchlist.config.PUBLIC_CHANNEL_SECRET`.  See
+``main.py::PacketPipeline._on_watchlist_changed`` for where that
+secret is registered with the decoder.
 
 File schema::
 
     {
         "version": 1,
         "channels": [
-            {"idx": 0, "name": "#mc-radar"},
-            {"idx": 1, "name": "#weather"}
+            {"idx": 0, "name": "Public"},
+            {"idx": 1, "name": "#mc-radar"},
+            {"idx": 2, "name": "#weather"}
         ]
     }
 """
@@ -24,7 +41,13 @@ from hashlib import sha256
 from pathlib import Path
 from typing import Callable, Dict, List, Optional
 
-from meshcore_watchlist.config import WATCHLIST_FILE, WATCHLIST_HOME, debug_print
+from meshcore_watchlist.config import (
+    PUBLIC_CHANNEL_CANONICAL_NAME,
+    WATCHLIST_FILE,
+    WATCHLIST_HOME,
+    debug_print,
+    is_public_channel_name,
+)
 
 WATCHLIST_VERSION = 1
 
@@ -53,10 +76,17 @@ class WatchlistStore:
     # ------------------------------------------------------------------
 
     def _load(self) -> None:
-        """Read watchlist.json from disk; create an empty file if missing."""
+        """Read watchlist.json from disk; create an empty file if missing.
+
+        Always finishes with the Public-channel invariant enforced
+        (see :meth:`_ensure_public_invariant_locked`).  Persists the
+        result if anything had to be changed, so the file on disk
+        always reflects the canonical layout after a service start.
+        """
         WATCHLIST_HOME.mkdir(parents=True, exist_ok=True)
         if not self._path.exists():
             self._channels = []
+            self._ensure_public_invariant_locked()
             self._save_locked()
             return
         try:
@@ -67,11 +97,15 @@ class WatchlistStore:
                     f"starting empty"
                 )
                 self._channels = []
-                return
-            self._channels = list(data.get("channels", []))
-            # Re-index defensively in case the file was hand-edited.
-            for i, ch in enumerate(self._channels):
-                ch["idx"] = i
+            else:
+                self._channels = list(data.get("channels", []))
+                # Re-index defensively in case the file was hand-edited.
+                for i, ch in enumerate(self._channels):
+                    ch["idx"] = i
+            before = [dict(c) for c in self._channels]
+            self._ensure_public_invariant_locked()
+            if self._channels != before:
+                self._save_locked()
             debug_print(
                 f"WatchlistStore: loaded {len(self._channels)} channels "
                 f"from {self._path}"
@@ -79,6 +113,47 @@ class WatchlistStore:
         except (json.JSONDecodeError, OSError) as exc:
             debug_print(f"WatchlistStore: load error: {exc}; starting empty")
             self._channels = []
+            self._ensure_public_invariant_locked()
+
+    def _ensure_public_invariant_locked(self) -> None:
+        """Make sure exactly one Public entry exists at ``idx == 0``.
+
+        Caller MUST hold ``self._lock`` (or be running before any
+        threads exist, as in ``__init__``).
+
+        Tolerates legacy and hand-edited files: any entry whose name
+        matches :func:`is_public_channel_name` (case-insensitive,
+        ``#``-tolerant) is treated as the Public channel.  If multiple
+        such entries exist, the first is kept and the others are
+        dropped.  The kept entry is renamed to the canonical form
+        and moved to position 0.  All entries are then re-indexed.
+
+        If no Public entry exists, one is inserted at the front.
+        """
+        public_entries: List[Dict] = [
+            ch for ch in self._channels if is_public_channel_name(ch.get("name", ""))
+        ]
+        non_public_entries: List[Dict] = [
+            ch for ch in self._channels if not is_public_channel_name(ch.get("name", ""))
+        ]
+
+        if public_entries:
+            kept = public_entries[0]
+            kept["name"] = PUBLIC_CHANNEL_CANONICAL_NAME
+            if len(public_entries) > 1:
+                debug_print(
+                    f"WatchlistStore: dropping {len(public_entries) - 1} "
+                    f"duplicate Public entries"
+                )
+        else:
+            kept = {"name": PUBLIC_CHANNEL_CANONICAL_NAME}
+            debug_print(
+                "WatchlistStore: Public entry missing, inserting at idx=0"
+            )
+
+        self._channels = [kept] + non_public_entries
+        for i, ch in enumerate(self._channels):
+            ch["idx"] = i
 
     def _save_locked(self) -> None:
         """Persist current channel list (caller MUST hold the lock)."""
@@ -104,15 +179,25 @@ class WatchlistStore:
             return [dict(c) for c in self._channels]
 
     def add(self, name: str) -> bool:
-        """Add a hashtag channel by name.
+        """Add a channel by name.
 
-        The leading ``#`` is enforced (added if missing).  Duplicates
-        (case-sensitive name match) are rejected silently and return
-        ``False``.
+        Public is system-managed and always present at ``idx == 0``,
+        so ``add("Public")`` (any case, optional ``#``) is a no-op
+        that returns ``True`` — the channel is already on the
+        watchlist by virtue of the invariant, and reporting that
+        as a user error would be confusing.
+
+        For any other channel, the leading ``#`` is enforced (added
+        if missing).  Duplicates (case-sensitive name match) are
+        rejected silently and return ``False``.
         """
         name = name.strip()
         if not name:
             return False
+        if is_public_channel_name(name):
+            # Already guaranteed present by the invariant — no work,
+            # not an error.
+            return True
         if not name.startswith("#"):
             name = "#" + name
 
@@ -130,9 +215,23 @@ class WatchlistStore:
         return True
 
     def remove(self, idx: int) -> bool:
-        """Remove the channel at the given index, then reindex."""
+        """Remove the channel at the given index, then reindex.
+
+        Public (``idx == 0``) is system-managed and cannot be
+        removed; calls targeting it return ``False`` and leave the
+        list unchanged.  Defensively, any entry whose name matches
+        :func:`is_public_channel_name` is also protected, in case
+        the on-disk file ever drifts from the canonical layout.
+        """
         with self._lock:
             if not (0 <= idx < len(self._channels)):
+                return False
+            target = self._channels[idx]
+            if idx == 0 or is_public_channel_name(target.get("name", "")):
+                debug_print(
+                    f"WatchlistStore: refused to remove Public "
+                    f"(idx={idx}, name={target.get('name')!r})"
+                )
                 return False
             removed = self._channels.pop(idx)
             for i, ch in enumerate(self._channels):

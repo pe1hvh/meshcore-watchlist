@@ -122,6 +122,9 @@ def _build_watchlist_panel(
     archive trigger and a progress widget."""
 
     # ── Add row ───────────────────────────────────────────────────────
+    # Public is system-managed (always present at idx=0, see
+    # WatchlistStore._ensure_public_invariant_locked) so this input is
+    # only for user-managed hashtag channels.
     with ui.row().classes("w-full items-end gap-2"):
         name_input = ui.input(
             label="Hashtag channel",
@@ -258,7 +261,8 @@ def _build_watchlist_panel(
     # Per-row action buttons:
     #   refresh → rescan archive scoped to this channel only
     #             (POST /api/v1/rescan/{idx} equivalent, in-process)
-    #   delete  → remove channel from watchlist
+    #   delete  → remove channel from watchlist (hashtag channels only;
+    #             hidden for Public at idx=0, which is system-managed)
     # The Quasar emits travel up to the parent table component, where
     # the Python handlers below (table.on(...)) catch them.
     table.add_slot(
@@ -269,7 +273,7 @@ def _build_watchlist_panel(
                    @click="$parent.$emit('rescan_channel', props.row)">
                 <q-tooltip>Rescan archive for this channel</q-tooltip>
             </q-btn>
-            <q-btn dense flat icon="delete" color="negative"
+            <q-btn v-if="props.row.idx !== 0" dense flat icon="delete" color="negative"
                    @click="$parent.$emit('remove', props.row)">
                 <q-tooltip>Remove channel from watchlist</q-tooltip>
             </q-btn>
@@ -279,8 +283,34 @@ def _build_watchlist_panel(
 
     def _on_remove(e) -> None:
         idx = e.args.get("idx")
-        if idx is not None and store.remove(int(idx)):
-            ui.notify("Removed", color="positive")
+        name = e.args.get("name", "") or f"ch{idx}"
+        if idx is None:
+            return
+
+        # Confirmation dialog — built on demand so each click gets a
+        # fresh dialog scoped to that row, and we don't have to track
+        # which row a long-lived dialog refers to.
+        with ui.dialog() as confirm, ui.card().classes("min-w-80"):
+            ui.label(f"Remove {name} from the watchlist?").classes(
+                "text-base font-medium"
+            )
+            ui.label(
+                "New messages on this channel will no longer be decoded. "
+                "Messages already in the archive are not affected."
+            ).classes("text-sm opacity-75")
+            with ui.row().classes("justify-end w-full gap-2 q-mt-sm"):
+                ui.button("Cancel", on_click=confirm.close).props("flat")
+
+                def _do_remove() -> None:
+                    confirm.close()
+                    if store.remove(int(idx)):
+                        ui.notify(f"Removed {name}", color="positive")
+                    else:
+                        ui.notify("Remove failed", color="warning")
+
+                ui.button("Remove", on_click=_do_remove).props("color=negative")
+
+        confirm.open()
 
     def _on_rescan_channel(e) -> None:
         idx = e.args.get("idx")

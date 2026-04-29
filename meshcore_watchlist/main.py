@@ -28,8 +28,10 @@ from nicegui import ui
 from meshcore_watchlist.config import (
     HOST,
     PORT,
+    PUBLIC_CHANNEL_SECRET,
     VERSION,
     debug_print,
+    is_public_channel_name,
 )
 from meshcore_watchlist.api.routes import register_routes
 from meshcore_watchlist.core.models import Message, RxLogEntry
@@ -77,7 +79,15 @@ class PacketPipeline:
         for ch in channels:
             idx = ch["idx"]
             name = ch["name"]
-            self._decoder.add_channel_key_from_name(idx, name)
+            # Public channel uses a fixed well-known secret, not the
+            # SHA-256(name)[:16] derivation that hashtag channels use.
+            # See PUBLIC_CHANNEL_SECRET in config.py.
+            if is_public_channel_name(name):
+                self._decoder.add_channel_key(
+                    idx, PUBLIC_CHANNEL_SECRET, source="public-default",
+                )
+            else:
+                self._decoder.add_channel_key_from_name(idx, name)
             self._channel_name_by_idx[idx] = name
 
         # Push channel list into SharedData so the GUI tabs render.

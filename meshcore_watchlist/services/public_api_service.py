@@ -26,6 +26,8 @@ from collections import Counter
 from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
+from meshcore_watchlist.config import is_public_channel_name
+
 if TYPE_CHECKING:
     from meshcore_watchlist.core.shared_data import SharedData
 
@@ -39,8 +41,16 @@ _STATS_FETCH_LIMIT: int = 50_000
 # ---------------------------------------------------------------------------
 
 def is_public_channel(idx: Optional[int], name: str) -> bool:
-    """Return True for public (idx 0) or hashtag (#-prefixed) channels."""
-    if idx == 0:
+    """Return True for the Public channel or any hashtag channel.
+
+    The Public channel is identified by name (see
+    ``is_public_channel_name`` in ``config.py``) rather than by list
+    position: the watchlist's ``idx`` is just the zero-based position
+    in the user's list, not a meshcore-gui device-channel slot, so a
+    user who adds ``#weather`` before Public would otherwise get
+    Public mis-classified as private.
+    """
+    if is_public_channel_name(name):
         return True
     if name and name.startswith("#"):
         return True
@@ -152,6 +162,7 @@ def get_messages_payload(
     for i, msg in enumerate(page):
         items.append({
             "id":            offset + i + 1,
+            "message_hash":  msg.get("message_hash", "") or "",
             "channel_idx":   msg.get("channel"),
             "channel_name":  msg.get("channel_name", ""),
             "sender":        msg.get("sender", ""),

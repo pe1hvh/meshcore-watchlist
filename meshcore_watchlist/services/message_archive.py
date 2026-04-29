@@ -114,17 +114,32 @@ class MessageArchive:
     # Add operations (buffered)
     # ------------------------------------------------------------------
 
-    def add_message(self, msg: Message) -> None:
+    def add_message(
+        self,
+        msg: Message,
+        timestamp_utc: Optional[str] = None,
+    ) -> None:
         """Add a message to the archive (buffered write).
-        
+
         Args:
             msg: Message dataclass instance.
+            timestamp_utc: ISO-8601 UTC timestamp to record on the
+                stored row.  Defaults to ``datetime.now(timezone.utc)``,
+                which is the right answer for live-tail ingest (when
+                "now" is approximately the packet's arrival time) but
+                wrong for historical data being replayed by the
+                rescanner.  The rescanner therefore derives the
+                original arrival timestamp from the rxlog source and
+                passes it explicitly.
         """
         with self._lock:
             # Convert to dict and add UTC timestamp
             msg_dict = {
                 "time": msg.time,
-                "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+                "timestamp_utc": (
+                    timestamp_utc
+                    or datetime.now(timezone.utc).isoformat()
+                ),
                 "sender": msg.sender,
                 "text": msg.text,
                 "channel": msg.channel,
@@ -148,17 +163,26 @@ class MessageArchive:
             elif self._should_flush():
                 self._flush_all()
 
-    def add_rx_log(self, entry: RxLogEntry) -> None:
+    def add_rx_log(
+        self,
+        entry: RxLogEntry,
+        timestamp_utc: Optional[str] = None,
+    ) -> None:
         """Add an RX log entry to the archive (buffered write).
-        
+
         Args:
             entry: RxLogEntry dataclass instance.
+            timestamp_utc: ISO-8601 UTC timestamp to record on the
+                stored row.  See :meth:`add_message` for rationale.
         """
         with self._lock:
             # Convert to dict and add UTC timestamp
             entry_dict = {
                 "time": entry.time,
-                "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+                "timestamp_utc": (
+                    timestamp_utc
+                    or datetime.now(timezone.utc).isoformat()
+                ),
                 "snr": entry.snr,
                 "rssi": entry.rssi,
                 "payload_type": entry.payload_type,

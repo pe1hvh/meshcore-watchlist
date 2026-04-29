@@ -14,7 +14,7 @@ from pathlib import Path
 # Version
 # ---------------------------------------------------------------------------
 
-VERSION: str = "0.2.0"
+VERSION: str = "0.2.2"
 
 # ---------------------------------------------------------------------------
 # Paths
@@ -54,6 +54,41 @@ TAILER_POLL_SECONDS: float = 1.0
 
 MESSAGE_RETENTION_DAYS: int = 7
 RXLOG_RETENTION_DAYS: int = 7
+
+# ---------------------------------------------------------------------------
+# Public channel
+# ---------------------------------------------------------------------------
+# The MeshCore Public channel does NOT follow the SHA-256(name)[:16]
+# derivation rule that hashtag channels use.  In the firmware its
+# secret slot is represented as 16 zero bytes (see Companion Protocol
+# SET_CHANNEL spec) but on-air encryption uses a fixed well-known
+# 16-byte secret, hard-coded in the firmware and reference decoders.
+#
+# We register that secret directly when a watchlist entry is named
+# "Public" (case-insensitive).  If the firmware ever rotates this
+# value, change it here in one place.
+#
+# Source of the current value: michaelhart/meshcore-decoder
+# (TypeScript) and the matching Python meshcoredecoder package, both
+# of which list it as the Public-channel test secret.
+
+PUBLIC_CHANNEL_CANONICAL_NAME: str = "Public"
+PUBLIC_CHANNEL_SECRET_HEX: str = "8b3387e9c5cdea6ac9e5edbaa115cd72"
+PUBLIC_CHANNEL_SECRET: bytes = bytes.fromhex(PUBLIC_CHANNEL_SECRET_HEX)
+
+
+def is_public_channel_name(name: str) -> bool:
+    """True iff ``name`` refers to the MeshCore Public channel.
+
+    Case-insensitive; tolerates a stray leading ``#`` from older
+    watchlist files where ``WatchlistStore.add()`` force-prefixed
+    every name.
+    """
+    if not name:
+        return False
+    stripped = name.lstrip("#").strip().lower()
+    return stripped == PUBLIC_CHANNEL_CANONICAL_NAME.lower()
+
 
 # ---------------------------------------------------------------------------
 # Debug

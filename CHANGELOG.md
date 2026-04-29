@@ -5,6 +5,151 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.2] - 2026-04-29
+
+### Fixed
+
+- **Rescan stamped historical messages with the rescan moment as
+  their `timestamp_utc`.** `MessageArchive.add_message()` and
+  `add_rx_log()` unconditionally wrote
+  `timestamp_utc = datetime.now(timezone.utc)` on every insert.
+  For the live tail this was approximately right ("now" ≈
+  packet arrival time); for the rescanner — added in 0.2.0 to
+  replay days of history through the same code path — it was
+  catastrophically wrong: every newly-decoded historical row
+  ended up clustered at the rescan moment, breaking
+  `query_messages` time-sort, the `/api/v1/stats` 72-hour
+  window, and any downstream consumer using `timestamp_utc` as
+  a cursor or dedup key.
+
+  Should have been caught when the rescanner was written. It
+  wasn't. This release is the apology.
+
+  `add_message()` and `add_rx_log()` now accept an optional
+  `timestamp_utc` parameter; when supplied (only by the
+  rescanner), it is used in place of `now()`. The rescanner
+  derives the original arrival time from each record via
+  `derive_record_timestamp_utc()` in
+  `services/archive_rescanner.py`, which tries, in priority
+  order: an ISO timestamp on the record itself
+  (`timestamp_utc` / `timestamp` / `received_at` / `ts`); the
+  record's `time` field combined with a date extracted from
+  the rxlog filename (recognises `YYYY-MM-DD`, `YYYYMMDD`,
+  `YYYY_MM_DD` patterns anywhere in the name); the rxlog
+  file's mtime; and `now()` only as a final fallback, with a
+  debug log marking which records failed all heuristics.
+
+  Live-tail behaviour is unchanged.
+
+  Affected files:
+  `meshcore_watchlist/services/message_archive.py`,
+  `meshcore_watchlist/core/shared_data.py`,
+  `meshcore_watchlist/services/archive_rescanner.py`.
+
+### Changed
+
+- **API: `/api/v1/messages` items now include `message_hash`.**
+  Previously the only stable per-message identifier in the
+  response was the positional `id` (= `offset + i + 1`), which
+  shifts whenever the underlying archive changes order — so
+  any downstream collector using it as a dedup key or cursor
+  would re-emit rows after every rescan. The packet's
+  deterministic `message_hash` was already on every archived
+  row but was not exposed. It is now the first identifier
+  field after `id`. Existing consumers that don't read it are
+  unaffected; new consumers should prefer it as the dedup key.
+
+  Affected file:
+  `meshcore_watchlist/services/public_api_service.py`.
+
+### Notes
+
+- **Cleanup of the in-place damage from 0.2.1 + first rescan**
+  is the operator's responsibility — these fixes prevent
+  recurrence but do not retroactively rewrite the
+  ISO-timestamp column on rows already written. Identifying
+  the affected rows in the on-disk archive (or in any
+  downstream MariaDB / similar): they share an unusually
+  uniform `timestamp_utc` clustered within a few seconds of
+  the rescan job's start time (visible in the service log as
+  `ArchiveRescanner: starting job <id>`). For exact recovery
+  the rescan can be re-run after deleting both the affected
+  rows and the corresponding fingerprint entries, since this
+  release will then write the correct historical timestamps.
+
+## [0.2.1] - 2026-04-29
+
+### Fixed
+
+- **Public-channel messages were never decoded.** Adding the
+  Public channel via the Watchlist tab stored it as `#Public`
+  because `WatchlistStore.add()` unconditionally force-prefixed
+  the leading `#`, then derived its key as
+  `SHA-256("#Public")[:16]`. The actual MeshCore Public channel
+  uses a fixed well-known 16-byte secret that is not derivable
+  from any name (the firmware's `SET_CHANNEL` slot represents it
+  as 16 zero bytes — see Companion Protocol — but on-air
+  encryption uses the real well-known value). No registered key
+  matched, so packets arrived as undecoded `RxLogEntry` rows but
+  no `Message` rows were ever produced, making the channel look
+  silent.
+
+  The well-known secret is now defined as
+  `PUBLIC_CHANNEL_SECRET` in `config.py` along with the
+  canonical name `"Public"` and an `is_public_channel_name()`
+  helper that recognises `Public`, `public`, `PUBLIC`, with or
+  without a leading `#`, with whitespace tolerance. The
+  `PacketPipeline` watchlist subscriber now special-cases the
+  Public name and registers the fixed secret directly via
+  `PacketDecoder.add_channel_key()` instead of the
+  name-derivation path used for hashtag channels. If the
+  firmware ever rotates this value, change it in one place.
+
+  Existing `#Public` watchlist entries from before the fix
+  continue to work — the helper tolerates the stray `#` — so no
+  migration of `watchlist.json` is required. Run a rescan after
+  upgrading to retroactively decode any Public-channel packets
+  that were ingested as undecoded rxlog rows during the bug
+  window.
+
+  Affected files: `meshcore_watchlist/config.py`,
+  `meshcore_watchlist/main.py`,
+  `meshcore_watchlist/services/watchlist_store.py`.
+
+- **API: Public channel mis-classified when not first in list.**
+  `is_public_channel(idx, name)` in
+  `services/public_api_service.py` returned `True` for `idx == 0`
+  as a meshcore-gui legacy assumption. In the watchlist `idx` is
+  just zero-based list position, not a device-channel slot, so a
+  user who added `#weather` before Public would get Public's
+  messages and stats filtered out of `/api/v1/messages` and
+  `/api/v1/stats`. Classification is now name-based via
+  `is_public_channel_name()`, independent of list position.
+
+  Affected file:
+  `meshcore_watchlist/services/public_api_service.py`.
+
+### Changed
+
+- **Dashboard: confirmation dialog before removing a watchlist
+  channel.** The per-row delete icon now opens an English
+  confirmation dialog ("Remove `<name>` from the watchlist?")
+  with Cancel / Remove buttons before calling
+  `WatchlistStore.remove()`. Public has no delete icon (slot
+  template `v-if="props.row.idx !== 0"`) and is therefore
+  unaffected.
+
+  Affected file: `meshcore_watchlist/gui/dashboard.py`.
+
+### Notes
+
+- The dashboard slot template comments referencing
+  `WatchlistStore._ensure_public_invariant_locked` are stale —
+  no such method exists, and Public's position at idx 0 is a
+  consequence of add-order rather than an enforced invariant.
+  Left untouched in this release; either correcting the comment
+  or implementing the invariant is left for a future change.
+
 ## [0.2.0] - 2026-04-28
 
 ### Added
@@ -128,6 +273,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   under `~/.meshcore-watchlist/archive/`, expose a NiceGUI dashboard
   and a public REST API.
 
+[0.2.2]: #022---2026-04-29
+[0.2.1]: #021---2026-04-29
 [0.2.0]: #020---2026-04-28
 [0.1.1]: #011---2026-04-27
 [0.1.0]: #010---initial-release

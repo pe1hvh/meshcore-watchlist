@@ -77,12 +77,21 @@ class SharedData:
     # ------------------------------------------------------------------
 
     def add_message(self, msg: Message) -> None:
-        """Append a message, persist to archive, dedup by fingerprint."""
+        """Append a message, persist to archive, dedup by fingerprint.
+
+        Fingerprint is keyed off ``channel_name``, not ``channel`` (the
+        int idx).  See module-level invariant: ``channel_name`` is the
+        stable channel identity; ``channel`` is a vluchtige UI-positie
+        en mag nooit deel zijn van een identity-key.  When a watchlist
+        is reordered, an unchanged channel keeps its name but gets a
+        new idx, and a fingerprint that included idx would re-ingest
+        every historical message under the new number.
+        """
         fp = (
             msg.message_hash or "",
             msg.sender,
             msg.text,
-            msg.channel,
+            msg.channel_name,
         )
         with self.lock:
             if fp in self._message_fingerprints:
@@ -231,9 +240,9 @@ class SharedData:
 
         Args:
             msg: Message dataclass instance.
-            archive_message_fps: Set of ``(hash, sender, text, channel)``
-                tuples already in the archive at the start of the rescan
-                job.
+            archive_message_fps: Set of
+                ``(hash, sender, text, channel_name)`` tuples already
+                in the archive at the start of the rescan job.
             timestamp_utc: ISO-8601 UTC timestamp to record on the
                 archive row.  Should be the original packet arrival
                 time.  See :meth:`ingest_rescanned_rxlog`.
@@ -246,7 +255,7 @@ class SharedData:
             msg.message_hash or "",
             msg.sender,
             msg.text,
-            msg.channel,
+            msg.channel_name,
         )
         if fp in archive_message_fps:
             return False
@@ -300,50 +309,60 @@ class SharedData:
         if not self.archive:
             return
 
-        # Messages
+        # Messages — read from JSONL line-by-line and keep only the
+        # last MAX_MESSAGES.  We don't load the whole file into memory
+        # (for a large archive that's gigabytes); we read all records
+        # but only retain a sliding window via the bounded list slice
+        # at the end.
         try:
             msgs_path = self.archive._messages_path  # noqa: SLF001
-            if msgs_path.exists():
-                import json as _json
-                from dataclasses import fields as _fields
-                data = _json.loads(msgs_path.read_text(encoding="utf-8"))
-                raw = data.get("messages", [])[-self.MAX_MESSAGES:]
-                msg_field_names = {f.name for f in _fields(Message)}
-                for d in raw:
-                    kwargs = {k: v for k, v in d.items() if k in msg_field_names}
-                    try:
-                        m = Message(**kwargs)
-                    except TypeError:
-                        continue
-                    fp = (
-                        m.message_hash or "",
-                        m.sender,
-                        m.text,
-                        m.channel,
-                    )
-                    self._message_fingerprints.add(fp)
-                    self.messages.append(m)
+            from dataclasses import fields as _fields
+            msg_field_names = {f.name for f in _fields(Message)}
+            recent: List[Message] = []
+            for d in self.archive._iter_records(msgs_path):  # noqa: SLF001
+                kwargs = {k: v for k, v in d.items() if k in msg_field_names}
+                try:
+                    m = Message(**kwargs)
+                except TypeError:
+                    continue
+                recent.append(m)
+                # Trim well above the cap so the trailing window is
+                # cheap to maintain.
+                if len(recent) > self.MAX_MESSAGES * 2:
+                    recent = recent[-self.MAX_MESSAGES:]
+            recent = recent[-self.MAX_MESSAGES:]
+            for m in recent:
+                fp = (
+                    m.message_hash or "",
+                    m.sender,
+                    m.text,
+                    m.channel_name,
+                )
+                self._message_fingerprints.add(fp)
+                self.messages.append(m)
         except Exception as exc:
             debug_print(f"Archive replay (messages) error: {exc}")
 
-        # RX log
+        # RX log — same streaming pattern as messages.
         try:
             rx_path = self.archive._rxlog_path  # noqa: SLF001
-            if rx_path.exists():
-                import json as _json
-                from dataclasses import fields as _fields
-                data = _json.loads(rx_path.read_text(encoding="utf-8"))
-                raw = data.get("entries", [])[-self.MAX_RX_LOG:]
-                rx_field_names = {f.name for f in _fields(RxLogEntry)}
-                for d in raw:
-                    kwargs = {k: v for k, v in d.items() if k in rx_field_names}
-                    try:
-                        r = RxLogEntry(**kwargs)
-                    except TypeError:
-                        continue
-                    if r.message_hash:
-                        self._rxlog_hashes.add(r.message_hash)
-                    self.rx_log.append(r)
+            from dataclasses import fields as _fields
+            rx_field_names = {f.name for f in _fields(RxLogEntry)}
+            recent_rx: List[RxLogEntry] = []
+            for d in self.archive._iter_records(rx_path):  # noqa: SLF001
+                kwargs = {k: v for k, v in d.items() if k in rx_field_names}
+                try:
+                    r = RxLogEntry(**kwargs)
+                except TypeError:
+                    continue
+                recent_rx.append(r)
+                if len(recent_rx) > self.MAX_RX_LOG * 2:
+                    recent_rx = recent_rx[-self.MAX_RX_LOG:]
+            recent_rx = recent_rx[-self.MAX_RX_LOG:]
+            for r in recent_rx:
+                if r.message_hash:
+                    self._rxlog_hashes.add(r.message_hash)
+                self.rx_log.append(r)
         except Exception as exc:
             debug_print(f"Archive replay (rx_log) error: {exc}")
 

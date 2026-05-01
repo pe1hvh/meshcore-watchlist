@@ -9,6 +9,13 @@ Three tabs:
 Read-only with respect to the radio (no TX).  Writes only happen
 to the local watchlist.json via WatchlistStore, and to the message /
 rxlog archive via the rescan job (when triggered).
+
+Per-row rescan (0.2.6) sends ``channel_name`` — the stable channel
+identity per ADR-001 — to the rescan-manager, not the row's
+``idx``.  The progress label exposes the new ``decoded_total`` and
+``not_decryptable`` counters so the operator can distinguish "the
+decoder did nothing" from "everything was already in the archive"
+when the rescan reports +0 new messages.
 """
 
 from __future__ import annotations
@@ -19,7 +26,11 @@ from nicegui import ui
 
 from meshcore_watchlist.config import VERSION, debug_print
 from meshcore_watchlist.core.shared_data import SharedData
-from meshcore_watchlist.services.archive_rescanner import RescanBusyError
+from meshcore_watchlist.services.archive_rescanner import (
+    InvalidRescanWindow,
+    RescanBusyError,
+    UnknownChannelName,
+)
 from meshcore_watchlist.services.watchlist_store import WatchlistStore
 
 if TYPE_CHECKING:
@@ -146,7 +157,22 @@ def _build_watchlist_panel(
     # Stored as a single-element list so the closure can mutate it.
     watched_job: List[Optional[str]] = [None]
 
+    # Since 0.2.5 (template 2, mechanism 2) every rescan must carry an
+    # explicit ``start_date`` / ``end_date`` window — no implicit
+    # defaults.  Two date inputs are shown next to the rescan button
+    # and feed both the full-archive and the per-channel rescan paths.
+    # The ``ui.date`` widget already validates the YYYY-MM-DD format;
+    # the rescan-job manager re-validates server-side and surfaces a
+    # 400 / InvalidRescanWindow if anything is wrong.
     with ui.row().classes("w-full items-center gap-2 q-mt-md"):
+        with ui.input("Start date").props(
+            "type=date dense outlined"
+        ).classes("w-44") as start_date_input:
+            pass
+        with ui.input("End date (incl.)").props(
+            "type=date dense outlined"
+        ).classes("w-44") as end_date_input:
+            pass
         rescan_btn = ui.button(
             "Rescan archive",
             icon="refresh",
@@ -155,15 +181,60 @@ def _build_watchlist_panel(
         progress_bar = ui.linear_progress(value=0).classes("flex-grow")
         progress_bar.visible = False
 
-    def _start_job(only_channel_idx: Optional[int], label: str) -> None:
+    def _current_window() -> Optional[tuple]:
+        """Read the date inputs.  Returns ``(start, end)`` strings on
+        success, ``None`` after notifying the user about an empty field.
+
+        Server-side ``InvalidRescanWindow`` is the source of truth for
+        format / ordering checks; we only catch the most common UI
+        slip-up (a missing field) here so the operator gets a quick
+        notify without a round-trip.
+        """
+        start = (start_date_input.value or "").strip()
+        end = (end_date_input.value or "").strip()
+        if not start or not end:
+            ui.notify(
+                "Pick both a start date and an end date for the rescan",
+                color="warning",
+            )
+            return None
+        return start, end
+
+    def _start_job(only_channel_name: Optional[str], label: str) -> None:
         """Submit a rescan job and wire the GUI to watch its progress.
 
         Shared by the full-rescan button and the per-channel buttons
         in the table action column.  *label* is a short human string
         ("full archive", "#mc-radar") used in toast notifications.
+
+        Reads the ``start_date_input`` / ``end_date_input`` values and
+        passes them to ``rescan_manager.submit``.  An empty input or
+        a server-side validation failure shows a notify and returns
+        without queuing a job.
+
+        Per ADR-001 the channel scope is ``channel_name`` (stable
+        identity), not idx.  ``None`` means "full archive across all
+        watchlist channels".
         """
+        window = _current_window()
+        if window is None:
+            return
+        start_date, end_date = window
         try:
-            job = rescan_manager.submit(only_channel_idx=only_channel_idx)
+            job = rescan_manager.submit(
+                start_date=start_date,
+                end_date=end_date,
+                only_channel_name=only_channel_name,
+            )
+        except InvalidRescanWindow as exc:
+            ui.notify(f"Invalid rescan window: {exc}", color="negative")
+            return
+        except UnknownChannelName as exc:
+            ui.notify(
+                f"Channel {exc.channel_name!r} is not in the watchlist",
+                color="negative",
+            )
+            return
         except RescanBusyError as exc:
             ui.notify(
                 f"Rescan already running (job {exc.running_job_id[:8]})",
@@ -180,7 +251,8 @@ def _build_watchlist_panel(
             ui.notify(f"Rescan failed to start: {exc}", color="negative")
             return
         ui.notify(
-            f"Rescanning {label} (job {job.job_id[:8]})",
+            f"Rescanning {label} {start_date}..{end_date} "
+            f"(job {job.job_id[:8]})",
             color="positive",
         )
         watched_job[0] = job.job_id
@@ -190,7 +262,7 @@ def _build_watchlist_panel(
         progress_label.text = f"starting ({label})…"
 
     def _on_rescan() -> None:
-        _start_job(only_channel_idx=None, label="full archive")
+        _start_job(only_channel_name=None, label="full archive")
 
     rescan_btn.on("click", _on_rescan)
 
@@ -199,6 +271,15 @@ def _build_watchlist_panel(
 
         Updates the progress bar and label, then re-enables the
         button when the job reaches a terminal state.
+
+        The label exposes the four counters that distinguish the
+        possible "+0 new" outcomes from each other (ontwerp 0.2.6
+        §3a.1):
+
+          - ``decoded_total``    — decoder produced a GroupText match
+          - ``new_messages``     — those of which were freshly archived
+          - ``not_decryptable``  — GroupText with no matching key
+          - ``new_rxlog``        — fresh raw rxlog rows
         """
         jid = watched_job[0]
         if jid is None:
@@ -220,9 +301,11 @@ def _build_watchlist_panel(
         progress_label.text = (
             f'{d["status"]} — {prog["bytes_done"]:,}/{prog["bytes_total"]:,} B '
             f'({prog["percent"]}%) · '
-            f'+{counts["new_messages"]} msgs, '
-            f'+{counts["new_rxlog"]} rxlog, '
-            f'{counts["skipped_dup_rxlog"]} dup-skipped'
+            f'+{counts["decoded_total"]} dec '
+            f'(+{counts["new_messages"]} new, '
+            f'{counts["skipped_dup_message"]} dup), '
+            f'{counts["not_decryptable"]} undec, '
+            f'+{counts["new_rxlog"]} rx'
         )
 
         if d["status"] in ("done", "failed"):
@@ -230,7 +313,9 @@ def _build_watchlist_panel(
             rescan_btn.enable()
             if d["status"] == "done":
                 ui.notify(
-                    f'Rescan done: +{counts["new_messages"]} new messages',
+                    f'Rescan done: +{counts["new_messages"]} new messages '
+                    f'({counts["decoded_total"]} decoded, '
+                    f'{counts["not_decryptable"]} not decryptable)',
                     color="positive",
                 )
             else:
@@ -260,7 +345,8 @@ def _build_watchlist_panel(
 
     # Per-row action buttons:
     #   refresh → rescan archive scoped to this channel only
-    #             (POST /api/v1/rescan/{idx} equivalent, in-process)
+    #             (POST /api/v1/rescan/by-name equivalent, in-process,
+    #             keyed on channel_name per ADR-001)
     #   delete  → remove channel from watchlist (hashtag channels only;
     #             hidden for Public at idx=0, which is system-managed)
     # The Quasar emits travel up to the parent table component, where
@@ -313,11 +399,18 @@ def _build_watchlist_panel(
         confirm.open()
 
     def _on_rescan_channel(e) -> None:
-        idx = e.args.get("idx")
-        name = e.args.get("name") or f"ch{idx}"
-        if idx is None:
+        """Per-row rescan handler — scopes the job by channel name.
+
+        ADR-001: the rescan-manager is invoked with the row's
+        ``channel_name`` (stable identity), never with its ``idx``
+        (a vluchtige UI-positie that can be different on the next
+        watchlist mutation).  The label shown in the toast is the
+        same ``name`` so the user sees what they clicked.
+        """
+        name = e.args.get("name") or ""
+        if not name:
             return
-        _start_job(only_channel_idx=int(idx), label=name)
+        _start_job(only_channel_name=name, label=name)
 
     table.on("remove", _on_remove)
     table.on("rescan_channel", _on_rescan_channel)

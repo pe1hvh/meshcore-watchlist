@@ -9,11 +9,19 @@ NiceGUI/FastAPI application instance — same surface as meshcore-gui.
     GET  /api/v1/messages
     GET  /api/v1/channels
 
-Plus the rescan control-plane endpoints (added in 0.2.0):
+Plus the rescan control-plane endpoints:
 
     POST /api/v1/rescan              → submit full rescan
-    POST /api/v1/rescan/{idx}        → submit per-channel rescan
+    POST /api/v1/rescan/by-name      → submit per-channel rescan (0.2.6)
     GET  /api/v1/rescan/{job_id}     → job status
+
+Compared to 0.2.5 the per-channel rescan moved from
+``POST /api/v1/rescan/{idx}`` to
+``POST /api/v1/rescan/by-name?channel_name=...`` per ADR-001:
+``channel_name`` is the stable channel identity, ``idx`` is a
+vluchtige UI-positie that should never participate in API paths.
+The old ``/rescan/{idx}`` endpoint is no longer registered;
+clients calling it receive the FastAPI default 404.
 
 Call :func:`register_routes` once from ``main.py`` after
 :class:`SharedData` is constructed and before ``ui.run()`` is called.
@@ -23,12 +31,16 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
-from fastapi import HTTPException, Path as PathParam, Query
+from fastapi import HTTPException, Query
 from fastapi.responses import JSONResponse
 from nicegui import app as _nicegui_app
 
 from meshcore_watchlist.config import debug_print
-from meshcore_watchlist.services.archive_rescanner import RescanBusyError
+from meshcore_watchlist.services.archive_rescanner import (
+    InvalidRescanWindow,
+    RescanBusyError,
+    UnknownChannelName,
+)
 from meshcore_watchlist.services.public_api_service import (
     get_channels_payload,
     get_messages_payload,
@@ -69,7 +81,7 @@ def register_routes(
         shared: SharedData instance backing the read-only ``/api/v1/*``
             endpoints.
         rescan_manager: Rescan job manager backing the control-plane
-            ``/api/v1/rescan*`` endpoints (added in 0.2.0).
+            ``/api/v1/rescan*`` endpoints.
     """
 
     @_nicegui_app.get(
@@ -114,18 +126,46 @@ def register_routes(
         return _cors_response(get_channels_payload(shared))
 
     # ------------------------------------------------------------------
-    # Rescan control plane (0.2.0)
+    # Rescan control plane
     # ------------------------------------------------------------------
 
     @_nicegui_app.post(
         "/api/v1/rescan",
         tags=["MeshCore Watchlist Rescan"],
-        summary="Submit a full archive rescan",
+        summary="Submit a full archive rescan over an explicit date window",
         response_class=JSONResponse,
     )
-    async def api_rescan_full() -> JSONResponse:
+    async def api_rescan_full(
+        start_date: str = Query(
+            ...,
+            description=(
+                "Inclusive lower bound of the rescan window, "
+                "ISO-8601 YYYY-MM-DD UTC day."
+            ),
+        ),
+        end_date: str = Query(
+            ...,
+            description=(
+                "Inclusive upper bound of the rescan window, "
+                "ISO-8601 YYYY-MM-DD UTC day. Must be on or after "
+                "start_date."
+            ),
+        ),
+    ) -> JSONResponse:
         try:
-            job = rescan_manager.submit(only_channel_idx=None)
+            job = rescan_manager.submit(
+                start_date=start_date,
+                end_date=end_date,
+                only_channel_name=None,
+            )
+        except InvalidRescanWindow as exc:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "error": "invalid_rescan_window",
+                    "message": str(exc),
+                },
+            )
         except RescanBusyError as exc:
             raise HTTPException(
                 status_code=409,
@@ -137,24 +177,68 @@ def register_routes(
         return JSONResponse(status_code=202, content=job.to_dict())
 
     @_nicegui_app.post(
-        "/api/v1/rescan/{idx}",
+        "/api/v1/rescan/by-name",
         tags=["MeshCore Watchlist Rescan"],
-        summary="Submit a per-channel archive rescan",
+        summary="Submit a per-channel archive rescan, scoped by channel name",
         response_class=JSONResponse,
     )
-    async def api_rescan_channel(
-        idx: int = PathParam(..., ge=0, description="Watchlist channel idx"),
+    async def api_rescan_by_name(
+        channel_name: str = Query(
+            default="",
+            description=(
+                "Channel name to scope the rescan to (e.g. \"#test\"). "
+                "URL-encode '#' as '%23'.  Must be in the current "
+                "watchlist; otherwise 404.  Empty / missing → 400."
+            ),
+        ),
+        start_date: str = Query(
+            ...,
+            description=(
+                "Inclusive lower bound of the rescan window, "
+                "ISO-8601 YYYY-MM-DD UTC day."
+            ),
+        ),
+        end_date: str = Query(
+            ...,
+            description=(
+                "Inclusive upper bound of the rescan window, "
+                "ISO-8601 YYYY-MM-DD UTC day. Must be on or after "
+                "start_date."
+            ),
+        ),
     ) -> JSONResponse:
-        # Reject indices not present in the current watchlist so users
-        # don't get a silently-empty rescan.
-        channels = shared.get_channels()
-        if not any(ch.get("idx") == idx for ch in channels):
+        # An empty / missing channel_name is a client error — surface
+        # it as 400 *before* any other validation.  FastAPI's Query
+        # default of ``""`` (rather than ``...``) lets us produce our
+        # own message instead of FastAPI's generic
+        # "field required" payload.
+        if not channel_name:
             raise HTTPException(
-                status_code=404,
-                detail={"error": "channel_idx_not_in_watchlist", "idx": idx},
+                status_code=400,
+                detail={"error": "missing_channel_name"},
             )
         try:
-            job = rescan_manager.submit(only_channel_idx=idx)
+            job = rescan_manager.submit(
+                start_date=start_date,
+                end_date=end_date,
+                only_channel_name=channel_name,
+            )
+        except InvalidRescanWindow as exc:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "error": "invalid_rescan_window",
+                    "message": str(exc),
+                },
+            )
+        except UnknownChannelName as exc:
+            raise HTTPException(
+                status_code=404,
+                detail={
+                    "error": "channel_name_not_in_watchlist",
+                    "channel_name": exc.channel_name,
+                },
+            )
         except RescanBusyError as exc:
             raise HTTPException(
                 status_code=409,
@@ -176,12 +260,12 @@ def register_routes(
         if job is None:
             raise HTTPException(
                 status_code=404,
-                detail={"error": "job_not_found", "job_id": job_id},
+                detail={"error": "unknown_job", "job_id": job_id},
             )
         return _cors_response(job.to_dict())
 
     debug_print(
         "Public API registered: /api/v1/stats, /api/v1/nodes, "
         "/api/v1/messages, /api/v1/channels, "
-        "/api/v1/rescan (POST, GET status)"
+        "/api/v1/rescan (POST full + by-name, GET status)"
     )

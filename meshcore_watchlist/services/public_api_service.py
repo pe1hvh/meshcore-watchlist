@@ -35,6 +35,16 @@ if TYPE_CHECKING:
 STATS_PERIOD_HOURS: int = 72
 _STATS_FETCH_LIMIT: int = 50_000
 
+# Single-call ceiling for /api/v1/messages.  Generous enough to fit any
+# realistic archive in one scan so that ``total`` reflects the true
+# filtered dataset size and downstream paginators (e.g. domca's PHP
+# collector) can walk pages until ``offset >= total`` without being
+# silently truncated by an interaction between offset, limit, and a
+# small cap.  See A.1 in template 1: the previous cap of
+# ``offset + limit + 1000`` produced a moving ``total`` and cut the
+# collector off at ~1000 rows even when the archive held thousands more.
+_MESSAGES_FETCH_LIMIT: int = 10_000_000
+
 
 # ---------------------------------------------------------------------------
 # Channel classification
@@ -147,8 +157,12 @@ def get_messages_payload(
     if archive is None:
         return {"total": 0, "limit": limit, "offset": offset, "items": []}
 
-    fetch_limit = offset + limit + 1000
-    raw, _ = archive.query_messages(limit=fetch_limit, offset=0)
+    # Full filtered scan: ``total`` must equal the size of the filtered
+    # dataset, independent of the (limit, offset) the caller picked.
+    # Pre-0.2.5 used ``offset + limit + 1000`` here, which made
+    # ``total`` change per call and silently truncated paginators at
+    # ~1000 rows.  See _MESSAGES_FETCH_LIMIT comment above.
+    raw, _ = archive.query_messages(limit=_MESSAGES_FETCH_LIMIT, offset=0)
 
     public_msgs = [
         m for m in raw

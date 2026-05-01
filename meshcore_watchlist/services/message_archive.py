@@ -5,28 +5,47 @@ Stores all incoming messages and RX log entries with configurable retention.
 Works alongside SharedData: SharedData holds the latest N items for UI display,
 while MessageArchive persists everything to disk with automatic cleanup.
 
+Storage format
+~~~~~~~~~~~~~~
+As of 0.2.4 the archive is JSON-Lines (``.jsonl``) — one record per line,
+written append-only.  This replaces the read-merge-rewrite ``.json`` format
+used in 0.2.3 and earlier, which became O(N²) on each flush as the archive
+grew (every flush re-serialised the entire history).  Append-only writes
+make every flush O(buffer-size) regardless of total archive size.
+
 Storage location
 ~~~~~~~~~~~~~~~~
-~/.meshcore-watchlist/archive/<ADDRESS>_messages.json
-~/.meshcore-watchlist/archive/<ADDRESS>_rxlog.json
+~/.meshcore-watchlist/archive/<ADDRESS>_messages.jsonl
+~/.meshcore-watchlist/archive/<ADDRESS>_rxlog.jsonl
+
+Migration from 0.2.3 archives
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+On first start of 0.2.4, any existing ``.json`` archive (format version 1)
+is converted to ``.jsonl``: each entry is written as one line, then the
+old ``.json`` is renamed to ``.json.migrated-v1`` (kept for recovery —
+*not* deleted).  Subsequent starts skip the migration if a ``.jsonl``
+already exists.
 
 Retention strategy
 ~~~~~~~~~~~~~~~~~~
 - Messages older than MESSAGE_RETENTION_DAYS are purged daily
 - RxLog entries older than RXLOG_RETENTION_DAYS are purged daily
-- Cleanup runs in background (non-blocking)
+- Cleanup is a one-shot rewrite: read the whole .jsonl, filter, write
+  to a temp .jsonl, atomic rename.  Done once per cleanup cycle, not
+  per insert, so the O(N²) trap of the old format is avoided.
 
 Thread safety
 ~~~~~~~~~~~~~~
-All methods use an internal lock for thread-safe operation.
+All public methods use an internal lock for thread-safe operation.
 The lock is separate from SharedData's lock to avoid contention.
 """
 
 import json
+import os
 import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, Iterator, List, Optional
 
 from meshcore_watchlist.config import (
     MESSAGE_RETENTION_DAYS,
@@ -35,13 +54,18 @@ from meshcore_watchlist.config import (
 )
 from meshcore_watchlist.core.models import Message, RxLogEntry
 
-ARCHIVE_VERSION = 1
 ARCHIVE_DIR = Path.home() / ".meshcore-watchlist" / "archive"
+
+# Format version is encoded in the filename suffix, not inside the file:
+#   *.json   = format 1 (legacy, read-merge-rewrite)
+#   *.jsonl  = format 2 (current, append-only)
+# A constant is kept for the in-flight legacy reader/migrator only.
+LEGACY_ARCHIVE_VERSION = 1
 
 
 class MessageArchive:
     """Persistent storage for messages and RX log entries.
-    
+
     Args:
         device_id: Device identifier string (used to derive filenames).
     """
@@ -49,7 +73,7 @@ class MessageArchive:
     def __init__(self, device_id: str) -> None:
         self._address = device_id
         self._lock = threading.Lock()
-        
+
         # Sanitize address for filename
         safe_name = (
             device_id
@@ -57,61 +81,170 @@ class MessageArchive:
             .replace(":", "_")
             .replace("/", "_")
         )
-        
-        self._messages_path = ARCHIVE_DIR / f"{safe_name}_messages.json"
-        self._rxlog_path = ARCHIVE_DIR / f"{safe_name}_rxlog.json"
-        
+
+        # Current (format-2) paths
+        self._messages_path = ARCHIVE_DIR / f"{safe_name}_messages.jsonl"
+        self._rxlog_path = ARCHIVE_DIR / f"{safe_name}_rxlog.jsonl"
+
+        # Legacy (format-1) paths used only for one-shot migration
+        self._legacy_messages_path = ARCHIVE_DIR / f"{safe_name}_messages.json"
+        self._legacy_rxlog_path = ARCHIVE_DIR / f"{safe_name}_rxlog.json"
+
         # In-memory batch buffers (flushed periodically)
         self._message_buffer: List[Dict] = []
         self._rxlog_buffer: List[Dict] = []
-        
-        # Batch write thresholds
-        self._batch_size = 10
+
+        # Batch write thresholds.  The legacy archive used batch_size=10
+        # to keep per-flush rewrite cost down, which was a tiny gain
+        # against the O(N²) cost of re-serialising the whole archive.
+        # Append-only writes make batch_size irrelevant for correctness
+        # and dominated by syscall overhead for performance: anything in
+        # the 50–500 range performs nearly identically.  500 picked so a
+        # single rescan tick rarely triggers more than a handful of
+        # fsyncs.
+        self._batch_size = 500
         self._last_flush = datetime.now(timezone.utc)
         self._flush_interval_seconds = 60
-        
+
         # Stats
         self._total_messages = 0
         self._total_rxlog = 0
-        
-        # Load existing archives
-        self._load_archives()
+
+        # One-shot migration of any legacy .json archives.
+        ARCHIVE_DIR.mkdir(parents=True, exist_ok=True)
+        self._migrate_legacy_if_needed(
+            legacy=self._legacy_messages_path,
+            target=self._messages_path,
+            array_key="messages",
+            kind="messages",
+        )
+        self._migrate_legacy_if_needed(
+            legacy=self._legacy_rxlog_path,
+            target=self._rxlog_path,
+            array_key="entries",
+            kind="rxlog",
+        )
+
+        # Count existing entries (cheap line-count, not a full parse).
+        self._total_messages = self._count_lines(self._messages_path)
+        self._total_rxlog = self._count_lines(self._rxlog_path)
+        debug_print(
+            f"Archive: opened (messages={self._total_messages}, "
+            f"rxlog={self._total_rxlog})"
+        )
 
     # ------------------------------------------------------------------
-    # Initialization
+    # Migration from legacy format-1 (.json) to format-2 (.jsonl)
     # ------------------------------------------------------------------
 
-    def _load_archives(self) -> None:
-        """Load existing archive files and count entries."""
-        with self._lock:
-            # Load messages
-            if self._messages_path.exists():
-                try:
-                    data = json.loads(self._messages_path.read_text(encoding="utf-8"))
-                    if data.get("version") == ARCHIVE_VERSION:
-                        self._total_messages = len(data.get("messages", []))
-                        debug_print(
-                            f"Archive: loaded {self._total_messages} messages "
-                            f"from {self._messages_path}"
-                        )
-                except (json.JSONDecodeError, OSError) as exc:
-                    debug_print(f"Archive: error loading messages: {exc}")
-            
-            # Load rxlog
-            if self._rxlog_path.exists():
-                try:
-                    data = json.loads(self._rxlog_path.read_text(encoding="utf-8"))
-                    if data.get("version") == ARCHIVE_VERSION:
-                        self._total_rxlog = len(data.get("entries", []))
-                        debug_print(
-                            f"Archive: loaded {self._total_rxlog} rxlog entries "
-                            f"from {self._rxlog_path}"
-                        )
-                except (json.JSONDecodeError, OSError) as exc:
-                    debug_print(f"Archive: error loading rxlog: {exc}")
+    @staticmethod
+    def _migrate_legacy_if_needed(
+        legacy: Path,
+        target: Path,
+        array_key: str,
+        kind: str,
+    ) -> None:
+        """Convert ``legacy`` (.json, format 1) to ``target`` (.jsonl).
+
+        No-op if ``target`` already exists or ``legacy`` does not.
+        On success, ``legacy`` is renamed to ``legacy.migrated-v1`` —
+        we keep it for recovery rather than delete.
+        """
+        if target.exists():
+            return
+        if not legacy.exists():
+            return
+        debug_print(
+            f"Archive: migrating legacy {kind} archive "
+            f"{legacy.name} -> {target.name}"
+        )
+        try:
+            data = json.loads(legacy.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            debug_print(
+                f"Archive: legacy {kind} archive at {legacy} is unreadable, "
+                f"leaving as-is and starting empty: {exc}"
+            )
+            return
+        if data.get("version") != LEGACY_ARCHIVE_VERSION:
+            debug_print(
+                f"Archive: legacy {kind} archive at {legacy} has unexpected "
+                f"version {data.get('version')}, leaving as-is"
+            )
+            return
+        records = data.get(array_key, [])
+        # Write atomically to a tmp .jsonl then rename, so a crash mid-
+        # migration leaves the legacy file untouched.
+        tmp = target.with_suffix(target.suffix + ".tmp")
+        try:
+            with tmp.open("w", encoding="utf-8") as f:
+                for rec in records:
+                    f.write(json.dumps(rec, ensure_ascii=False))
+                    f.write("\n")
+                f.flush()
+                os.fsync(f.fileno())
+            tmp.replace(target)
+        except OSError as exc:
+            debug_print(f"Archive: migration write failed: {exc}")
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+            return
+        # Park the legacy file for recovery rather than delete.
+        try:
+            legacy.replace(legacy.with_suffix(legacy.suffix + ".migrated-v1"))
+        except OSError as exc:
+            debug_print(
+                f"Archive: post-migration rename failed (non-fatal): {exc}"
+            )
+        debug_print(f"Archive: migrated {len(records)} {kind} records")
+
+    @staticmethod
+    def _count_lines(path: Path) -> int:
+        """Cheap line count for stats — does not parse content."""
+        if not path.exists():
+            return 0
+        n = 0
+        try:
+            with path.open("rb") as f:
+                for _ in f:
+                    n += 1
+        except OSError:
+            return 0
+        return n
 
     # ------------------------------------------------------------------
-    # Add operations (buffered)
+    # Read helper used by every query method
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _iter_records(path: Path) -> Iterator[Dict]:
+        """Yield each record from a .jsonl file.
+
+        Silently skips malformed lines; never raises.  Returns an
+        empty iterator if the file does not exist.
+        """
+        if not path.exists():
+            return
+        try:
+            with path.open("r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        yield json.loads(line)
+                    except json.JSONDecodeError:
+                        # Skip corrupted lines — ingest may have been
+                        # interrupted mid-write.  The next clean line
+                        # picks up where we left off.
+                        continue
+        except OSError as exc:
+            debug_print(f"Archive: read error on {path.name}: {exc}")
+
+    # ------------------------------------------------------------------
+    # Insert
     # ------------------------------------------------------------------
 
     def add_message(
@@ -119,7 +252,7 @@ class MessageArchive:
         msg: Message,
         timestamp_utc: Optional[str] = None,
     ) -> None:
-        """Add a message to the archive (buffered write).
+        """Add a message to the archive (buffered append-only write).
 
         Args:
             msg: Message dataclass instance.
@@ -133,7 +266,6 @@ class MessageArchive:
                 passes it explicitly.
         """
         with self._lock:
-            # Convert to dict and add UTC timestamp
             msg_dict = {
                 "time": msg.time,
                 "timestamp_utc": (
@@ -152,14 +284,11 @@ class MessageArchive:
                 "path_names": msg.path_names,
                 "message_hash": msg.message_hash,
             }
-            
+
             self._message_buffer.append(msg_dict)
-            
-            # Flush if batch size reached
+
             if len(self._message_buffer) >= self._batch_size:
                 self._flush_messages()
-            
-            # Also flush if interval exceeded
             elif self._should_flush():
                 self._flush_all()
 
@@ -168,7 +297,7 @@ class MessageArchive:
         entry: RxLogEntry,
         timestamp_utc: Optional[str] = None,
     ) -> None:
-        """Add an RX log entry to the archive (buffered write).
+        """Add an RX log entry to the archive (buffered append-only write).
 
         Args:
             entry: RxLogEntry dataclass instance.
@@ -176,7 +305,6 @@ class MessageArchive:
                 stored row.  See :meth:`add_message` for rationale.
         """
         with self._lock:
-            # Convert to dict and add UTC timestamp
             entry_dict = {
                 "time": entry.time,
                 "timestamp_utc": (
@@ -198,313 +326,181 @@ class MessageArchive:
                 "route_type": entry.route_type,
                 "packet_type_num": entry.packet_type_num,
             }
-            
+
             self._rxlog_buffer.append(entry_dict)
-            
-            # Flush if batch size reached
+
             if len(self._rxlog_buffer) >= self._batch_size:
                 self._flush_rxlog()
-            
-            # Also flush if interval exceeded
             elif self._should_flush():
                 self._flush_all()
 
     # ------------------------------------------------------------------
-    # Flushing (write to disk)
+    # Flush
     # ------------------------------------------------------------------
 
     def _should_flush(self) -> bool:
-        """Check if flush interval has been exceeded."""
+        """Check if it's time to flush based on interval."""
         elapsed = (datetime.now(timezone.utc) - self._last_flush).total_seconds()
         return elapsed >= self._flush_interval_seconds
 
     def _flush_messages(self) -> None:
-        """Flush message buffer to disk (MUST be called with lock held)."""
+        """Append-only flush of the message buffer (LOCK MUST BE HELD)."""
         if not self._message_buffer:
             return
-        
-        # Read existing archive
-        existing_messages = []
-        if self._messages_path.exists():
-            try:
-                data = json.loads(self._messages_path.read_text(encoding="utf-8"))
-                if data.get("version") == ARCHIVE_VERSION:
-                    existing_messages = data.get("messages", [])
-                else:
-                    debug_print(
-                        f"Archive: version mismatch in {self._messages_path}, "
-                        f"expected {ARCHIVE_VERSION}, got {data.get('version')}"
-                    )
-                    # Don't overwrite if version mismatch - keep buffer for retry
-                    return
-            except (json.JSONDecodeError, OSError) as exc:
-                debug_print(
-                    f"Archive: error reading existing messages from {self._messages_path}: {exc}"
-                )
-                # Don't overwrite corrupted file - keep buffer for retry
-                return
-        
-        # Append new messages
-        existing_messages.extend(self._message_buffer)
-        
+
+        ARCHIVE_DIR.mkdir(parents=True, exist_ok=True)
         try:
-            # Write atomically (temp file + rename)
-            self._write_atomic(
-                self._messages_path,
-                {
-                    "version": ARCHIVE_VERSION,
-                    "address": self._address,
-                    "last_updated": datetime.now(timezone.utc).isoformat(),
-                    "messages": existing_messages,
-                }
-            )
-            
-            self._total_messages = len(existing_messages)
-            debug_print(
-                f"Archive: flushed {len(self._message_buffer)} messages "
-                f"(total: {self._total_messages})"
-            )
-            
-            # Clear buffer only after successful write
-            self._message_buffer.clear()
-            self._last_flush = datetime.now(timezone.utc)
-            
-        except (OSError) as exc:
-            debug_print(f"Archive: error writing messages: {exc}")
-            # Keep buffer for retry
+            with self._messages_path.open("a", encoding="utf-8") as f:
+                for rec in self._message_buffer:
+                    f.write(json.dumps(rec, ensure_ascii=False))
+                    f.write("\n")
+                f.flush()
+                # fsync per flush for durability across crashes.  This
+                # is the dominant cost on rotational disks; on SSD/SD
+                # the cost is small enough that we keep it.
+                os.fsync(f.fileno())
+        except OSError as exc:
+            debug_print(f"Archive: error appending messages: {exc}")
+            # Keep buffer so the next flush retries.
+            return
+
+        self._total_messages += len(self._message_buffer)
+        debug_print(
+            f"Archive: flushed {len(self._message_buffer)} messages "
+            f"(total: {self._total_messages})"
+        )
+        self._message_buffer.clear()
+        self._last_flush = datetime.now(timezone.utc)
 
     def _flush_rxlog(self) -> None:
-        """Flush rxlog buffer to disk (MUST be called with lock held)."""
+        """Append-only flush of the rxlog buffer (LOCK MUST BE HELD)."""
         if not self._rxlog_buffer:
             return
-        
-        # Read existing archive
-        existing_entries = []
-        if self._rxlog_path.exists():
-            try:
-                data = json.loads(self._rxlog_path.read_text(encoding="utf-8"))
-                if data.get("version") == ARCHIVE_VERSION:
-                    existing_entries = data.get("entries", [])
-                else:
-                    debug_print(
-                        f"Archive: version mismatch in {self._rxlog_path}, "
-                        f"expected {ARCHIVE_VERSION}, got {data.get('version')}"
-                    )
-                    # Don't overwrite if version mismatch - keep buffer for retry
-                    return
-            except (json.JSONDecodeError, OSError) as exc:
-                debug_print(
-                    f"Archive: error reading existing rxlog from {self._rxlog_path}: {exc}"
-                )
-                # Don't overwrite corrupted file - keep buffer for retry
-                return
-        
-        # Append new entries
-        existing_entries.extend(self._rxlog_buffer)
-        
+
+        ARCHIVE_DIR.mkdir(parents=True, exist_ok=True)
         try:
-            # Write atomically (temp file + rename)
-            self._write_atomic(
-                self._rxlog_path,
-                {
-                    "version": ARCHIVE_VERSION,
-                    "address": self._address,
-                    "last_updated": datetime.now(timezone.utc).isoformat(),
-                    "entries": existing_entries,
-                }
-            )
-            
-            self._total_rxlog = len(existing_entries)
-            debug_print(
-                f"Archive: flushed {len(self._rxlog_buffer)} rxlog entries "
-                f"(total: {self._total_rxlog})"
-            )
-            
-            # Clear buffer only after successful write
-            self._rxlog_buffer.clear()
-            self._last_flush = datetime.now(timezone.utc)
-            
-        except (OSError) as exc:
-            debug_print(f"Archive: error writing rxlog: {exc}")
-            # Keep buffer for retry
+            with self._rxlog_path.open("a", encoding="utf-8") as f:
+                for rec in self._rxlog_buffer:
+                    f.write(json.dumps(rec, ensure_ascii=False))
+                    f.write("\n")
+                f.flush()
+                os.fsync(f.fileno())
+        except OSError as exc:
+            debug_print(f"Archive: error appending rxlog: {exc}")
+            return
+
+        self._total_rxlog += len(self._rxlog_buffer)
+        debug_print(
+            f"Archive: flushed {len(self._rxlog_buffer)} rxlog entries "
+            f"(total: {self._total_rxlog})"
+        )
+        self._rxlog_buffer.clear()
+        self._last_flush = datetime.now(timezone.utc)
 
     def _flush_all(self) -> None:
-        """Flush all buffers to disk (MUST be called with lock held)."""
+        """Flush both buffers (LOCK MUST BE HELD)."""
         self._flush_messages()
         self._flush_rxlog()
 
     def flush(self) -> None:
-        """Manually flush all pending writes to disk."""
+        """Public flush — acquires lock and writes everything pending."""
         with self._lock:
             self._flush_all()
 
     # ------------------------------------------------------------------
-    # Cleanup (retention)
+    # Retention cleanup
     # ------------------------------------------------------------------
 
     def cleanup_old_data(self) -> None:
         """Remove messages and rxlog entries older than retention period.
-        
-        This is intended to be called periodically (e.g., daily) as a
-        background task.
+
+        Called periodically (e.g. daily) as a background task.  Each
+        cleanup is a one-shot full rewrite: read the .jsonl, filter
+        out expired entries, write to a temp .jsonl, atomic rename.
         """
         with self._lock:
-            # Flush pending writes first
             self._flush_all()
-            
-            # Cleanup messages
-            self._cleanup_messages()
-            
-            # Cleanup rxlog
-            self._cleanup_rxlog()
+            self._cleanup_jsonl(
+                self._messages_path,
+                MESSAGE_RETENTION_DAYS,
+                kind="messages",
+            )
+            self._cleanup_jsonl(
+                self._rxlog_path,
+                RXLOG_RETENTION_DAYS,
+                kind="rxlog",
+            )
+            self._total_messages = self._count_lines(self._messages_path)
+            self._total_rxlog = self._count_lines(self._rxlog_path)
 
-    def _cleanup_messages(self) -> None:
-        """Remove messages older than MESSAGE_RETENTION_DAYS."""
-        if not self._messages_path.exists():
+    def _cleanup_jsonl(
+        self,
+        path: Path,
+        retention_days: int,
+        kind: str,
+    ) -> None:
+        """Rewrite *path*, dropping records older than *retention_days*."""
+        if not path.exists():
             return
-        
+        cutoff = datetime.now(timezone.utc) - timedelta(days=retention_days)
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        kept = 0
+        dropped = 0
         try:
-            data = json.loads(self._messages_path.read_text(encoding="utf-8"))
-            if data.get("version") != ARCHIVE_VERSION:
-                return
-            
-            messages = data.get("messages", [])
-            original_count = len(messages)
-            
-            # Calculate cutoff date
-            cutoff = datetime.now(timezone.utc) - timedelta(days=MESSAGE_RETENTION_DAYS)
-            
-            # Filter messages
-            filtered = [
-                msg for msg in messages
-                if self._is_newer_than(msg.get("timestamp_utc"), cutoff)
-            ]
-            
-            # Write back if anything was removed
-            if len(filtered) < original_count:
-                data["messages"] = filtered
-                data["last_updated"] = datetime.now(timezone.utc).isoformat()
-                self._write_atomic(self._messages_path, data)
-                
-                removed = original_count - len(filtered)
-                self._total_messages = len(filtered)
-                debug_print(
-                    f"Archive: cleanup removed {removed} old messages "
-                    f"(retained: {len(filtered)})"
-                )
-        
-        except (json.JSONDecodeError, OSError) as exc:
-            debug_print(f"Archive: error cleaning up messages: {exc}")
+            with tmp.open("w", encoding="utf-8") as out:
+                for rec in self._iter_records(path):
+                    if self._is_newer_than(rec.get("timestamp_utc"), cutoff):
+                        out.write(json.dumps(rec, ensure_ascii=False))
+                        out.write("\n")
+                        kept += 1
+                    else:
+                        dropped += 1
+                out.flush()
+                os.fsync(out.fileno())
+            tmp.replace(path)
+        except OSError as exc:
+            debug_print(f"Archive: cleanup write failed for {kind}: {exc}")
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+            return
 
-    def _cleanup_rxlog(self) -> None:
-        """Remove rxlog entries older than RXLOG_RETENTION_DAYS."""
-        if not self._rxlog_path.exists():
-            return
-        
-        try:
-            data = json.loads(self._rxlog_path.read_text(encoding="utf-8"))
-            if data.get("version") != ARCHIVE_VERSION:
-                return
-            
-            entries = data.get("entries", [])
-            original_count = len(entries)
-            
-            # Calculate cutoff date
-            cutoff = datetime.now(timezone.utc) - timedelta(days=RXLOG_RETENTION_DAYS)
-            
-            # Filter entries
-            filtered = [
-                entry for entry in entries
-                if self._is_newer_than(entry.get("timestamp_utc"), cutoff)
-            ]
-            
-            # Write back if anything was removed
-            if len(filtered) < original_count:
-                data["entries"] = filtered
-                data["last_updated"] = datetime.now(timezone.utc).isoformat()
-                self._write_atomic(self._rxlog_path, data)
-                
-                removed = original_count - len(filtered)
-                self._total_rxlog = len(filtered)
-                debug_print(
-                    f"Archive: cleanup removed {removed} old rxlog entries "
-                    f"(retained: {len(filtered)})"
-                )
-        
-        except (json.JSONDecodeError, OSError) as exc:
-            debug_print(f"Archive: error cleaning up rxlog: {exc}")
+        if dropped:
+            debug_print(
+                f"Archive: cleanup removed {dropped} old {kind} "
+                f"(retained: {kept})"
+            )
 
     # ------------------------------------------------------------------
     # Utilities
     # ------------------------------------------------------------------
 
-    def _is_newer_than(self, timestamp_str: Optional[str], cutoff: datetime) -> bool:
+    @staticmethod
+    def _is_newer_than(timestamp_str: Optional[str], cutoff: datetime) -> bool:
         """Check if ISO timestamp is newer than cutoff date."""
         if not timestamp_str:
             return False
-        
         try:
             timestamp = datetime.fromisoformat(timestamp_str)
             return timestamp > cutoff
         except (ValueError, TypeError):
             return False
 
-    def _write_atomic(self, path: Path, data: Dict) -> None:
-        """Write JSON data atomically using temp file + rename."""
-        # Ensure directory exists
-        ARCHIVE_DIR.mkdir(parents=True, exist_ok=True)
-        
-        # Write to temp file
-        temp_path = path.with_suffix(".tmp")
-        temp_path.write_text(
-            json.dumps(data, indent=2, ensure_ascii=False),
-            encoding="utf-8",
-        )
-        
-        # Atomic rename
-        temp_path.replace(path)
-
     # ------------------------------------------------------------------
     # Channel name discovery
     # ------------------------------------------------------------------
 
     def get_distinct_channel_names(self) -> list:
-        """Return a sorted list of distinct channel names from archived messages.
-
-        Scans all stored messages and collects unique ``channel_name``
-        values.  Empty or missing names are excluded.
-
-        Returns:
-            Sorted list of unique channel name strings.
-        """
+        """Return a sorted list of distinct channel names from archived messages."""
         with self._lock:
-            # Flush pending writes so we don't miss recent messages
             self._flush_messages()
-
-            if not self._messages_path.exists():
-                return []
-
-            try:
-                data = json.loads(
-                    self._messages_path.read_text(encoding="utf-8")
-                )
-                if data.get("version") != ARCHIVE_VERSION:
-                    return []
-
-                messages = data.get("messages", [])
-                names: set = set()
-                for msg in messages:
-                    name = msg.get("channel_name", "")
-                    if name:
-                        names.add(name)
-
-                return sorted(names)
-
-            except (json.JSONDecodeError, OSError) as exc:
-                debug_print(
-                    f"Archive: error reading distinct channel names: {exc}"
-                )
-                return []
+            names: set = set()
+            for rec in self._iter_records(self._messages_path):
+                name = rec.get("channel_name", "")
+                if name:
+                    names.add(name)
+            return sorted(names)
 
     # ------------------------------------------------------------------
     # Single message lookup
@@ -521,31 +517,11 @@ class MessageArchive:
         """
         if not message_hash:
             return None
-
         with self._lock:
-            # Flush pending writes so recent messages are searchable
             self._flush_messages()
-
-            if not self._messages_path.exists():
-                return None
-
-            try:
-                data = json.loads(
-                    self._messages_path.read_text(encoding="utf-8")
-                )
-                if data.get("version") != ARCHIVE_VERSION:
-                    return None
-
-                for msg in data.get("messages", []):
-                    if msg.get("message_hash") == message_hash:
-                        return msg
-
-            except (json.JSONDecodeError, OSError) as exc:
-                debug_print(
-                    f"Archive: error looking up hash {message_hash[:16]}: "
-                    f"{exc}"
-                )
-
+            for rec in self._iter_records(self._messages_path):
+                if rec.get("message_hash") == message_hash:
+                    return rec
         return None
 
     # ------------------------------------------------------------------
@@ -553,138 +529,88 @@ class MessageArchive:
     # ------------------------------------------------------------------
 
     def get_stats(self) -> Dict:
-        """Get archive statistics.
-        
-        Returns:
-            Dict with 'total_messages' and 'total_rxlog' counts.
-        """
+        """Return basic archive statistics."""
         with self._lock:
             return {
                 "total_messages": self._total_messages,
                 "total_rxlog": self._total_rxlog,
-                "pending_messages": len(self._message_buffer),
-                "pending_rxlog": len(self._rxlog_buffer),
+                "buffered_messages": len(self._message_buffer),
+                "buffered_rxlog": len(self._rxlog_buffer),
+                "messages_path": str(self._messages_path),
+                "rxlog_path": str(self._rxlog_path),
             }
 
     # ------------------------------------------------------------------
-    # Full-archive dedup loaders (used by the rescan job)
+    # Dedup-set loaders (used by the rescanner)
     # ------------------------------------------------------------------
 
     def load_all_rxlog_hashes(self) -> set:
-        """Return the set of every ``message_hash`` already in the archive.
-
-        Used by :class:`ArchiveRescanner` to suppress duplicate RX log
-        writes when rerunning over historical ``*_rxlog.jsonl`` files.
-        SharedData's in-memory ``_rxlog_hashes`` set is populated from
-        only the last :data:`SharedData.MAX_RX_LOG` archive entries on
-        startup, so it is unsuitable for archive-wide dedup.
-
-        Empty hashes are excluded.
-
-        Returns:
-            ``set[str]`` of hex message-hash strings.
-        """
+        """Return the set of message_hash strings for every archived rxlog row."""
         with self._lock:
             self._flush_rxlog()
-            if not self._rxlog_path.exists():
-                return set()
-            try:
-                data = json.loads(self._rxlog_path.read_text(encoding="utf-8"))
-                if data.get("version") != ARCHIVE_VERSION:
-                    return set()
-                return {
-                    e.get("message_hash", "")
-                    for e in data.get("entries", [])
-                    if e.get("message_hash")
-                }
-            except (json.JSONDecodeError, OSError) as exc:
-                debug_print(
-                    f"Archive: error loading rxlog hashes: {exc}"
-                )
-                return set()
+            return {
+                rec.get("message_hash", "")
+                for rec in self._iter_records(self._rxlog_path)
+                if rec.get("message_hash")
+            }
 
     def load_all_message_fingerprints(self) -> set:
-        """Return the set of fingerprints for every archived message.
+        """Return ``(hash, sender, text, channel_name)`` fingerprints
+        for every archived message.
 
-        Each fingerprint is a 4-tuple ``(message_hash, sender, text,
-        channel)`` matching :meth:`SharedData.add_message`'s in-memory
-        dedup tuple.  Used by :class:`ArchiveRescanner` to recognise
-        messages that have already been emitted on a previous decode
-        pass.  Loaded once at the start of a rescan job.
-
-        Returns:
-            ``set[tuple]`` of fingerprint tuples.
+        The fingerprint key is the channel **name**, not the integer
+        idx.  See ``SharedData.add_message`` for the invariant: idx is
+        a transient UI position that changes on watchlist mutation,
+        whereas the name is stable across mutations and is the channel
+        identity.
         """
         with self._lock:
             self._flush_messages()
-            if not self._messages_path.exists():
-                return set()
-            try:
-                data = json.loads(self._messages_path.read_text(encoding="utf-8"))
-                if data.get("version") != ARCHIVE_VERSION:
-                    return set()
-                return {
-                    (
-                        m.get("message_hash", "") or "",
-                        m.get("sender", ""),
-                        m.get("text", ""),
-                        m.get("channel"),
-                    )
-                    for m in data.get("messages", [])
-                }
-            except (json.JSONDecodeError, OSError) as exc:
-                debug_print(
-                    f"Archive: error loading message fingerprints: {exc}"
+            return {
+                (
+                    rec.get("message_hash", "") or "",
+                    rec.get("sender", ""),
+                    rec.get("text", ""),
+                    rec.get("channel_name", "") or "",
                 )
-                return set()
+                for rec in self._iter_records(self._messages_path)
+            }
+
+    # ------------------------------------------------------------------
+    # Sender lookup
+    # ------------------------------------------------------------------
 
     def get_messages_by_sender_pubkey(
-        self, pubkey_prefix: str, limit: int = 50,
+        self,
+        pubkey_prefix: str,
+        limit: int = 50,
     ) -> List[Dict]:
-        """Return archived messages whose *sender_pubkey* starts with *pubkey_prefix*.
-
-        Useful for loading Room Server history: room messages are stored
-        with ``sender_pubkey`` equal to the room's public-key prefix.
+        """Return archived messages whose ``sender_pubkey`` starts with
+        *pubkey_prefix*.
 
         Args:
-            pubkey_prefix: First N hex chars of the sender pubkey to match.
-            limit:         Maximum number of messages to return (newest).
+            pubkey_prefix: Lowercase hex prefix.
+            limit: Maximum number of messages (newest first).
 
         Returns:
-            List of message dicts (oldest-first), at most *limit* entries.
+            List of message dicts, newest first.
         """
+        if not pubkey_prefix:
+            return []
+        prefix = pubkey_prefix.lower()
+        matched: List[Dict] = []
         with self._lock:
-            # Flush pending writes so we don't miss recent messages
             self._flush_messages()
+            for rec in self._iter_records(self._messages_path):
+                pk = (rec.get("sender_pubkey", "") or "").lower()
+                if pk.startswith(prefix):
+                    matched.append(rec)
+        matched.sort(key=lambda m: m.get("timestamp_utc", ""))
+        return matched[-limit:][::-1]
 
-            if not self._messages_path.exists():
-                return []
-
-            try:
-                data = json.loads(
-                    self._messages_path.read_text(encoding="utf-8")
-                )
-                if data.get("version") != ARCHIVE_VERSION:
-                    return []
-
-                messages = data.get("messages", [])
-                norm = pubkey_prefix[:12]
-
-                matched = [
-                    msg for msg in messages
-                    if (msg.get("sender_pubkey") or "").startswith(norm)
-                ]
-
-                # Oldest-first, keep last *limit*
-                matched.sort(key=lambda m: m.get("timestamp_utc", ""))
-                return matched[-limit:]
-
-            except (json.JSONDecodeError, OSError) as exc:
-                debug_print(
-                    f"Archive: error querying by pubkey {pubkey_prefix[:12]}: "
-                    f"{exc}"
-                )
-                return []
+    # ------------------------------------------------------------------
+    # Filtered query (for the public API)
+    # ------------------------------------------------------------------
 
     def query_messages(
         self,
@@ -697,7 +623,7 @@ class MessageArchive:
         offset: int = 0,
     ) -> tuple:
         """Query archived messages with filters.
-        
+
         Args:
             after: Only messages after this timestamp (UTC).
             before: Only messages before this timestamp (UTC).
@@ -706,72 +632,51 @@ class MessageArchive:
             text_search: Search in message text (case-insensitive substring match).
             limit: Maximum number of results to return.
             offset: Skip this many results (for pagination).
-            
+
         Returns:
             Tuple of (messages, total_count):
             - messages: List of message dicts matching the filters, newest first
             - total_count: Total number of messages matching filters (for pagination)
         """
         with self._lock:
-            # Flush pending writes first
             self._flush_messages()
-            
-            if not self._messages_path.exists():
-                return [], 0
-            
-            try:
-                data = json.loads(self._messages_path.read_text(encoding="utf-8"))
-                if data.get("version") != ARCHIVE_VERSION:
-                    return [], 0
-                
-                messages = data.get("messages", [])
-                
-                # Apply filters
-                filtered = []
-                for msg in messages:
-                    # Time filters
-                    if after or before:
-                        try:
-                            msg_time = datetime.fromisoformat(msg.get("timestamp_utc", ""))
-                            if after and msg_time < after:
-                                continue
-                            if before and msg_time > before:
-                                continue
-                        except (ValueError, TypeError):
-                            continue
-                    
-                    # Channel name filter (exact match)
-                    if channel_name is not None:
-                        if msg.get("channel_name", "") != channel_name:
-                            continue
-                    
-                    # Sender filter (case-insensitive substring)
-                    if sender:
-                        msg_sender = msg.get("sender", "")
-                        if sender.lower() not in msg_sender.lower():
-                            continue
-                    
-                    # Text search (case-insensitive substring)
-                    if text_search:
-                        msg_text = msg.get("text", "")
-                        if text_search.lower() not in msg_text.lower():
-                            continue
-                    
-                    filtered.append(msg)
-                
-                # Sort newest first
-                filtered.sort(
-                    key=lambda m: m.get("timestamp_utc", ""),
-                    reverse=True
-                )
-                
-                total_count = len(filtered)
-                
-                # Apply pagination
-                paginated = filtered[offset:offset + limit]
-                
-                return paginated, total_count
-                
-            except (json.JSONDecodeError, OSError) as exc:
-                debug_print(f"Archive: error querying messages: {exc}")
-                return [], 0
+
+            sender_lower = sender.lower() if sender else None
+            text_lower = text_search.lower() if text_search else None
+
+            filtered: List[Dict] = []
+            for rec in self._iter_records(self._messages_path):
+                # Time filters
+                if after or before:
+                    try:
+                        msg_time = datetime.fromisoformat(rec.get("timestamp_utc", ""))
+                    except (ValueError, TypeError):
+                        continue
+                    if after and msg_time < after:
+                        continue
+                    if before and msg_time > before:
+                        continue
+
+                if channel_name is not None and rec.get("channel_name", "") != channel_name:
+                    continue
+
+                if sender_lower:
+                    msg_sender = rec.get("sender", "")
+                    if sender_lower not in msg_sender.lower():
+                        continue
+
+                if text_lower:
+                    msg_text = rec.get("text", "")
+                    if text_lower not in msg_text.lower():
+                        continue
+
+                filtered.append(rec)
+
+            filtered.sort(
+                key=lambda m: m.get("timestamp_utc", ""),
+                reverse=True,
+            )
+
+            total_count = len(filtered)
+            paginated = filtered[offset:offset + limit]
+            return paginated, total_count

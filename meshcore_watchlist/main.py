@@ -17,6 +17,13 @@ Pipeline::
               │
               └─ If GroupText decrypts with a watchlist key:
                   build Message → SharedData/archive
+
+Identity model (ADR-001).  The decoder is keyed on channel *name*.
+The pipeline maps that name to a current watchlist idx after the
+decode pass, purely for display in ``Message.channel``.  When the
+user has deleted the channel between decode and ingest the idx is
+``None`` — the message is still archived, just without a current
+watchlist position.
 """
 
 from __future__ import annotations
@@ -62,10 +69,22 @@ class PacketPipeline:
         self._shared = shared
         self._decoder = decoder
         self._store = store
-        self._channel_name_by_idx: Dict[int, str] = {}
 
-        # Subscribe to watchlist changes: refresh decoder keys + cached
-        # idx-to-name map, and propagate channel list to SharedData.
+        # Names currently registered in the decoder.  Used by
+        # ``_on_watchlist_changed`` to compute add / remove deltas
+        # against the new watchlist snapshot.  Keeping this set on the
+        # pipeline (instead of asking the decoder) keeps the decoder
+        # ignorant of watchlist semantics — the decoder just owns its
+        # key registry; the pipeline owns the watchlist→decoder
+        # synchronisation.
+        self._registered_names: set = set()
+
+        # Subscribe to watchlist changes: delta-update decoder keys and
+        # propagate the channel list to SharedData so the GUI tabs
+        # render.  Per §7 of ontwerp 0.2.6, mutations during a running
+        # rescan must keep the decoder current — clear+rebuild would
+        # leave a transient empty-key window which the rescan worker
+        # could land in; delta-update never empties the registry.
         store.subscribe(self._on_watchlist_changed)
 
     # ------------------------------------------------------------------
@@ -73,22 +92,49 @@ class PacketPipeline:
     # ------------------------------------------------------------------
 
     def _on_watchlist_changed(self, channels: List[Dict]) -> None:
-        # Reset and repopulate decoder keys.
-        self._decoder._secret_to_idx.clear()  # noqa: SLF001
-        self._channel_name_by_idx.clear()
+        """Sync decoder keys to the new watchlist via add/remove deltas.
+
+        Per ontwerp 0.2.6 §7 the decoder's ``_secret_to_name`` is kept
+        live during a running rescan: a freshly-added channel must
+        decode the very next record processed, a freshly-removed
+        channel must stop matching at all.  Delta-update via
+        ``add_channel_key`` / ``remove_channel_key`` (both specified
+        in §2 of the ontwerp) achieves that without ever leaving the
+        registry empty.
+
+        Note on naming changes (rename of an existing channel):
+        :class:`WatchlistStore` does not currently expose a rename
+        operation — channels can only be added or removed — so a
+        rename surfaces here as a remove of the old name plus an add
+        of the new name.  Both deltas are applied; no special-case
+        needed.
+        """
+        new_names: set = set()
         for ch in channels:
-            idx = ch["idx"]
-            name = ch["name"]
-            # Public channel uses a fixed well-known secret, not the
-            # SHA-256(name)[:16] derivation that hashtag channels use.
-            # See PUBLIC_CHANNEL_SECRET in config.py.
+            name = ch.get("name", "")
+            if not name:
+                continue
+            new_names.add(name)
+
+        # Removals first.  If a name is being replaced (rename:
+        # remove old, add new) doing remove first means the
+        # _secret_to_name dict never holds two entries for the same
+        # logical channel even mid-update.
+        for name in self._registered_names - new_names:
+            self._decoder.remove_channel_key(name)
+
+        # Additions.  Public uses a fixed well-known secret, not the
+        # SHA-256(name)[:16] derivation that hashtag channels use.
+        # See PUBLIC_CHANNEL_SECRET in config.py.
+        for name in new_names - self._registered_names:
             if is_public_channel_name(name):
                 self._decoder.add_channel_key(
-                    idx, PUBLIC_CHANNEL_SECRET, source="public-default",
+                    name, PUBLIC_CHANNEL_SECRET, source="public-default",
                 )
             else:
-                self._decoder.add_channel_key_from_name(idx, name)
-            self._channel_name_by_idx[idx] = name
+                self._decoder.add_channel_key_from_name(name)
+
+        self._registered_names = new_names
 
         # Push channel list into SharedData so the GUI tabs render.
         self._shared.set_channels(channels)
@@ -127,16 +173,33 @@ class PacketPipeline:
         if not raw_payload or not self._decoder.has_keys:
             return
 
+        # Live tail = no scope, no priority signal — the decoder
+        # iterates its registry in dict-iteration order.  Per
+        # ontwerp §3 the live decode path is unchanged from 0.2.5
+        # for the external observer.
         decoded = self._decoder.decode(raw_payload)
         if decoded is None or not decoded.is_decrypted:
             return
-        if decoded.channel_idx is None:
+        if not decoded.channel_name:
+            # Defensive: a successfully-decrypted GroupText always
+            # carries a channel_name set from the matching key.  This
+            # check guards against a future decoder regression where
+            # is_decrypted flips True without the name being populated.
             return
+
+        # Build the idx-by-name lookup against the *current* watchlist
+        # at ingest time.  ``channel_name`` is the identity (ADR-001);
+        # ``channel`` (idx) is a derived display attribute and may be
+        # ``None`` if the user has just removed the channel between
+        # decode and this line.
+        channels = self._store.list_channels()
+        idx_by_name = {ch.get("name", ""): ch.get("idx") for ch in channels}
+        idx = idx_by_name.get(decoded.channel_name)
 
         msg = Message.incoming(
             sender=decoded.sender,
             text=decoded.text,
-            channel=decoded.channel_idx,
+            channel=idx,
             time=rx_entry.time,
             snr=rx_entry.snr,
             path_len=decoded.path_length,
@@ -144,15 +207,13 @@ class PacketPipeline:
             path_names=rx_entry.path_names,
             message_hash=decoded.message_hash,
         )
-        # Channel name attribution (mirrors meshcore-gui Message handling).
-        ch_name = self._channel_name_by_idx.get(decoded.channel_idx, "")
-        if ch_name:
-            msg.channel_name = ch_name
+        msg.channel_name = decoded.channel_name
 
         self._shared.add_message(msg)
         debug_print(
-            f"Decoded GroupText: ch={decoded.channel_idx} ({ch_name}), "
-            f"sender={decoded.sender!r}, text={decoded.text[:40]!r}"
+            f"Decoded GroupText: channel={decoded.channel_name!r} "
+            f"(idx={idx}), sender={decoded.sender!r}, "
+            f"text={decoded.text[:40]!r}"
         )
 
 
@@ -177,7 +238,7 @@ def main() -> None:
     # button.  Independent of the live tailer — does not touch
     # state.json cursors.
     rescanner = ArchiveRescanner(shared=shared, decoder=decoder, store=store)
-    rescan_manager = RescanJobManager(rescanner)
+    rescan_manager = RescanJobManager(rescanner, store=store)
 
     # GUI
     build_dashboard(shared=shared, store=store, rescan_manager=rescan_manager)

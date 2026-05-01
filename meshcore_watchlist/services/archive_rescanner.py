@@ -18,6 +18,17 @@ to the archive.  It uses an archive-level dedup set (loaded once at
 job start) so it does not duplicate the historical ``RxLogEntry``
 rows already on disk.
 
+Identity model (ADR-001)
+~~~~~~~~~~~~~~~~~~~~~~~~
+The rescanner scopes jobs by channel **name**, never by watchlist
+idx.  ``RescanJob.only_channel_name`` is the stable identity; the
+priority order fetched once at job start is a list of names; the
+decoder is invoked with name-based parameters.  The decoder's key
+registry is kept current under watchlist mutations during the
+rescan (see :meth:`PacketPipeline._on_watchlist_changed`).  Reorder
+of the watchlist during a job has no effect on job scope or priority
+order — that is precisely the property ADR-001 buys us.
+
 Design constraints
 ~~~~~~~~~~~~~~~~~~
 * The live tailer keeps running with its existing cursors untouched
@@ -40,7 +51,7 @@ import re
 import threading
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import date as _date, datetime, timezone
 from enum import Enum
 from pathlib import Path
 from typing import Dict, List, Optional, TYPE_CHECKING
@@ -50,6 +61,10 @@ from meshcore_watchlist.config import (
     debug_print,
 )
 from meshcore_watchlist.core.models import Message, RxLogEntry
+from meshcore_watchlist.decoder.packet_decoder import PayloadType
+from meshcore_watchlist.services.channel_priority import (
+    fetch_priority_name_order,
+)
 
 if TYPE_CHECKING:
     from meshcore_watchlist.core.shared_data import SharedData
@@ -164,6 +179,154 @@ def derive_record_timestamp_utc(rec: Dict, file_path: Path) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Date-window validation (template 2, mechanism 2)
+# ---------------------------------------------------------------------------
+#
+# Every rescan job is bounded by a mandatory ``start_date`` / ``end_date``.
+# Both values are ISO-8601 ``YYYY-MM-DD`` *date* strings, no time
+# component.  They are interpreted as **UTC day bounds**:
+#
+#   start_date = 2026-04-15  →  inclusive from 2026-04-15 00:00:00 UTC
+#   end_date   = 2026-04-22  →  inclusive through 2026-04-22 23:59:59 UTC
+#
+# Inclusive-end is the convention here.  Half-open intervals lead to
+# off-by-one errors in UI and logs in practice; the user expects "from
+# the 15th through the 22nd" to include both days.
+#
+# On a Pi in NL (UTC+1 / UTC+2) this means a record received at
+# 2026-04-23 00:30 *local* falls outside an ``end_date = 2026-04-22``
+# window — it lives in 2026-04-22 23:30 UTC.  For day-level rescans
+# this is acceptable; the user can pick an extra day of overlap if
+# needed and the existing dedup absorbs it.
+
+
+class InvalidRescanWindow(ValueError):
+    """Raised when ``start_date`` / ``end_date`` are missing, malformed,
+    or in the wrong order.  Carries a human-readable message that the
+    REST layer surfaces verbatim in the 400 response body.
+    """
+
+
+class UnknownChannelName(ValueError):
+    """Raised when a per-channel rescan submit names a channel that is
+    not in the current watchlist.
+
+    Validated on submit-time per ontwerp 0.2.6 §9.2: a delete *after*
+    submit but *before* the worker picks up the job will not cause a
+    failure — the job runs but every record falls under
+    ``not_decryptable``, which is observable in the job counters.
+
+    Carries the offending name as ``channel_name`` so the REST layer
+    can echo it in the 404 response.
+    """
+
+    def __init__(self, channel_name: str) -> None:
+        super().__init__(
+            f"channel_name {channel_name!r} is not in the current watchlist"
+        )
+        self.channel_name = channel_name
+
+
+def parse_window_date(value: object, field_name: str) -> _date:
+    """Parse ``value`` as a ``YYYY-MM-DD`` string and return a ``date``.
+
+    Args:
+        value: Caller-supplied value.  Accepts ``str`` only — a stray
+            ``datetime`` slipping through gives a clear error rather
+            than a silent timezone surprise.
+        field_name: ``"start_date"`` or ``"end_date"``; used in the
+            error message so the caller can tell which side was bad.
+
+    Raises:
+        InvalidRescanWindow: missing / wrong type / unparseable.
+    """
+    if value is None or value == "":
+        raise InvalidRescanWindow(
+            f"{field_name} is required (ISO-8601 date, e.g. 2026-04-15)"
+        )
+    if not isinstance(value, str):
+        raise InvalidRescanWindow(
+            f"{field_name} must be a YYYY-MM-DD string, "
+            f"got {type(value).__name__}"
+        )
+    try:
+        return _date.fromisoformat(value)
+    except ValueError as exc:
+        raise InvalidRescanWindow(
+            f"{field_name} is not a valid YYYY-MM-DD date: {exc}"
+        )
+
+
+def validate_window(
+    start_date: object, end_date: object,
+) -> tuple[_date, _date]:
+    """Validate both ends and the ordering.  Returns the parsed dates.
+
+    Raises:
+        InvalidRescanWindow: any individual parse failure, or
+            ``start_date`` > ``end_date``.
+    """
+    start = parse_window_date(start_date, "start_date")
+    end = parse_window_date(end_date, "end_date")
+    if start > end:
+        raise InvalidRescanWindow(
+            f"start_date ({start.isoformat()}) is after "
+            f"end_date ({end.isoformat()})"
+        )
+    return start, end
+
+
+def _record_in_window(
+    ts_iso: str, start: _date, end: _date,
+) -> bool:
+    """True if *ts_iso* falls inside the inclusive-day window.
+
+    *ts_iso* comes from :func:`derive_record_timestamp_utc`, so it
+    is always a non-empty ISO-8601 string.  We treat unparseable
+    timestamps as inside-the-window: the record then falls through
+    to the existing dedup pipeline rather than being silently
+    dropped by a clock-recovery bug.  That preserves the pre-0.2.5
+    behaviour for malformed records — better than throwing them away.
+    """
+    candidate = ts_iso.replace("Z", "+00:00")
+    try:
+        dt = datetime.fromisoformat(candidate)
+    except ValueError:
+        return True
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    rec_date = dt.astimezone(timezone.utc).date()
+    return start <= rec_date <= end
+
+
+def _filename_window_skip(
+    filename: str, start: _date, end: _date,
+) -> bool:
+    """True if *filename* embeds a date-stamp wholly outside the
+    window, i.e. it can be skipped in its entirety.
+
+    Returns ``False`` (do **not** skip) for filenames without an
+    unambiguous date substring — those have to be parsed
+    record-by-record.  Returns ``False`` for the unbounded
+    ``*_rxlog.json`` snapshot which has no date in its filename.
+
+    The match logic uses the same :data:`_DATE_RE` regex that
+    ``derive_record_timestamp_utc`` uses for filename-derived
+    dates, so the two paths agree on what counts as "the date for
+    this file".
+    """
+    m = _DATE_RE.search(filename)
+    if not m:
+        return False
+    y, mo, d = m.groups()
+    try:
+        file_date = _date(int(y), int(mo), int(d))
+    except ValueError:
+        return False
+    return file_date < start or file_date > end
+
+
+# ---------------------------------------------------------------------------
 # Job model
 # ---------------------------------------------------------------------------
 
@@ -195,8 +358,16 @@ class RescanJob:
     Attributes:
         job_id:                Opaque hex string assigned at submit.
         status:                One of :class:`RescanStatus`.
-        only_channel_idx:      ``None`` for full rescan; integer for
-                               ``POST /api/v1/rescan/{idx}``.
+        only_channel_name:     ``None`` for full rescan; channel name
+                               (stable identity per ADR-001) for
+                               ``POST /api/v1/rescan/by-name``.
+        start_date:            Inclusive lower bound, ``YYYY-MM-DD``
+                               UTC day.  **Required** since 0.2.5
+                               (template 2, mechanism 2).  Validated
+                               by :func:`validate_window` before the
+                               job is ever queued.
+        end_date:              Inclusive upper bound, ``YYYY-MM-DD``
+                               UTC day.  **Required** since 0.2.5.
         started_at:            ISO-8601 timestamp (UTC) when the worker
                                thread picked the job up; ``None`` while
                                still queued.
@@ -206,29 +377,74 @@ class RescanJob:
                                be (or were) processed.
         new_messages:          Count of GroupText messages newly written
                                to the message archive on this run.
+        skipped_dup_message:   Count of GroupText messages successfully
+                               decoded whose fingerprint was already in
+                               the archive.  Together with
+                               ``new_messages`` this equals
+                               ``decoded_total`` on the message side.
+                               **New in 0.2.6** — without it the "+0
+                               new" diagnosis cannot distinguish
+                               "nothing decoded" from "everything was
+                               a duplicate".
         new_rxlog:             Count of RxLogEntry rows newly written to
                                the rxlog archive on this run (excludes
                                entries that were already present).
         skipped_dup_rxlog:     Count of historical lines whose
                                ``message_hash`` was already in the
                                archive — i.e. dedup hits.
+        decoded_total:         Count of GroupText packets successfully
+                               decrypted by the decoder during the job.
+                               **New in 0.2.6** — equals
+                               ``new_messages + skipped_dup_message``.
+                               Surfaces "decoder is doing work" even
+                               when every decoded packet is a duplicate.
+        not_decryptable:       Count of GroupText packets the decoder
+                               could not decrypt with any registered
+                               key (or with the scoped key when
+                               ``only_channel_name`` is set).
+                               **New in 0.2.6** — distinguishes "no key
+                               for this packet" from a structural
+                               decode failure.
+        skipped_window:        Count of historical lines whose recovered
+                               timestamp fell outside ``[start_date,
+                               end_date]``.  Reported separately so the
+                               operator can verify the window-filter
+                               actually fired.
+        skipped_files:         Count of source files that the
+                               filename-skip layer dropped wholesale
+                               (rxlog filename embeds a date outside
+                               the window).
         decode_failures:       Count of structurally-invalid packets
                                encountered during the rescan (logged
                                only at DEBUG).
+        priority_source:       ``"domca"`` if the priority list came
+                               from the domca-API fetch, ``"fallback"``
+                               if the API was unreachable / malformed
+                               and the rescan continued on watchlist
+                               order.  Reported in ``to_dict`` so the
+                               GUI / log can surface the degraded mode.
         error:                 Human-readable error string when
                                ``status == "failed"``.
     """
 
     job_id: str
+    start_date: str = ""
+    end_date: str = ""
     status: RescanStatus = RescanStatus.QUEUED
-    only_channel_idx: Optional[int] = None
+    only_channel_name: Optional[str] = None
     started_at: Optional[str] = None
     finished_at: Optional[str] = None
     files: List[FileProgress] = field(default_factory=list)
     new_messages: int = 0
+    skipped_dup_message: int = 0
     new_rxlog: int = 0
     skipped_dup_rxlog: int = 0
+    decoded_total: int = 0
+    not_decryptable: int = 0
+    skipped_window: int = 0
+    skipped_files: int = 0
     decode_failures: int = 0
+    priority_source: str = "fallback"
     error: Optional[str] = None
 
     def to_dict(self) -> Dict:
@@ -238,7 +454,10 @@ class RescanJob:
         return {
             "job_id": self.job_id,
             "status": self.status.value,
-            "only_channel_idx": self.only_channel_idx,
+            "only_channel_name": self.only_channel_name,
+            "start_date": self.start_date,
+            "end_date": self.end_date,
+            "priority_source": self.priority_source,
             "started_at": self.started_at,
             "finished_at": self.finished_at,
             "progress": {
@@ -256,8 +475,13 @@ class RescanJob:
             },
             "counts": {
                 "new_messages": self.new_messages,
+                "skipped_dup_message": self.skipped_dup_message,
                 "new_rxlog": self.new_rxlog,
                 "skipped_dup_rxlog": self.skipped_dup_rxlog,
+                "decoded_total": self.decoded_total,
+                "not_decryptable": self.not_decryptable,
+                "skipped_window": self.skipped_window,
+                "skipped_files": self.skipped_files,
                 "decode_failures": self.decode_failures,
             },
             "error": self.error,
@@ -295,12 +519,20 @@ class RescanJobManager:
     Args:
         rescanner: The :class:`ArchiveRescanner` whose ``run()`` method
                    does the actual work for each submitted job.
+        store: The :class:`WatchlistStore` used to validate per-channel
+                   rescan submits against the live watchlist on
+                   submit-time (per ontwerp 0.2.6 §9.2).
     """
 
     MAX_HISTORY = 16
 
-    def __init__(self, rescanner: "ArchiveRescanner") -> None:
+    def __init__(
+        self,
+        rescanner: "ArchiveRescanner",
+        store: "WatchlistStore",
+    ) -> None:
         self._rescanner = rescanner
+        self._store = store
         self._lock = threading.Lock()
         self._jobs: Dict[str, RescanJob] = {}
         self._running_job_id: Optional[str] = None
@@ -309,20 +541,57 @@ class RescanJobManager:
     # Submit
     # ------------------------------------------------------------------
 
-    def submit(self, only_channel_idx: Optional[int] = None) -> RescanJob:
+    def submit(
+        self,
+        start_date: str,
+        end_date: str,
+        only_channel_name: Optional[str] = None,
+    ) -> RescanJob:
         """Create a :class:`RescanJob` and dispatch a worker thread.
 
         Args:
-            only_channel_idx: When given, the rescanner restricts the
-                trial decode to that single channel.  See
+            start_date: Inclusive lower bound, ``YYYY-MM-DD`` UTC day.
+                Required since 0.2.5 (template 2, mechanism 2).  An
+                explicit window prevents accidental full-history
+                rescans on a 426-channel watchlist.
+            end_date: Inclusive upper bound, ``YYYY-MM-DD`` UTC day.
+                Required since 0.2.5.
+            only_channel_name: When given, the rescanner restricts the
+                trial decode to that single channel.  Validated
+                against the current watchlist on submit (per
+                ontwerp 0.2.6 §9.2 the validation moment is submit,
+                not job-start: a delete *after* submit but *before*
+                worker pickup leaves the job to run with all records
+                falling under ``not_decryptable``).  See
                 :meth:`PacketDecoder.decode`.
 
         Raises:
+            InvalidRescanWindow: ``start_date`` / ``end_date`` are
+                missing, malformed, or in the wrong order.  Surfaced
+                by the REST layer as a 400 response.
+            UnknownChannelName: ``only_channel_name`` is not in the
+                current watchlist.  Surfaced by the REST layer as a
+                404 response.
             RescanBusyError: A job is already running.
 
         Returns:
             The freshly-created :class:`RescanJob` (status ``queued``).
         """
+        # Validate up-front so a bad-window submission never occupies
+        # the single running-job slot.
+        start, end = validate_window(start_date, end_date)
+
+        # Validate the channel-name scope against the live watchlist
+        # on submit-time per ontwerp 0.2.6 §9.2.  Doing this outside
+        # ``self._lock`` is fine: the channel-list snapshot is
+        # whatever WatchlistStore has at the moment of the call;
+        # any mutation between this check and ``run()`` is by design
+        # tolerated and surfaces as not_decryptable in the counters.
+        if only_channel_name is not None:
+            channels = self._store.list_channels()
+            if not any(ch.get("name") == only_channel_name for ch in channels):
+                raise UnknownChannelName(only_channel_name)
+
         with self._lock:
             if self._running_job_id is not None:
                 raise RescanBusyError(self._running_job_id)
@@ -330,7 +599,9 @@ class RescanJobManager:
             job_id = uuid.uuid4().hex
             job = RescanJob(
                 job_id=job_id,
-                only_channel_idx=only_channel_idx,
+                start_date=start.isoformat(),
+                end_date=end.isoformat(),
+                only_channel_name=only_channel_name,
             )
             self._jobs[job_id] = job
             self._running_job_id = job_id
@@ -427,24 +698,61 @@ class ArchiveRescanner:
     def run(self, job: RescanJob) -> None:
         """Execute one rescan job.  Mutates ``job`` in place.
 
-        Loads the archive-wide dedup sets, walks each ``*_rxlog.jsonl``
-        file in lexicographic order, and feeds every line through
-        :meth:`_handle_line`.  Updates per-file progress and counters
-        on the ``job`` so the GUI can render them.
+        Loads the archive-wide dedup sets, fetches the domca priority
+        ranking once (frozen for the duration of the job per
+        ontwerp 0.2.6 §6.1), walks each ``*_rxlog.json[l]`` file
+        (skipping whole files whose filename embeds a date outside
+        the window), and feeds every line through :meth:`_handle_line`.
+        Updates per-file progress and counters on the ``job`` so the
+        GUI can render them.
         """
         job.status = RescanStatus.RUNNING
         job.started_at = datetime.now(timezone.utc).isoformat()
+
+        # Re-validate the window.  ``RescanJobManager.submit`` already
+        # validated it before queuing, but a job may also be
+        # constructed and ``run()`` called from a test path.  Defending
+        # here keeps the contract local to this method.
+        try:
+            window_start, window_end = validate_window(
+                job.start_date, job.end_date,
+            )
+        except InvalidRescanWindow as exc:
+            job.error = str(exc)
+            job.status = RescanStatus.FAILED
+            return
 
         if not self._source_dir.exists():
             job.error = f"source archive directory missing: {self._source_dir}"
             job.status = RescanStatus.FAILED
             return
 
-        # Build channel-name lookup (mirrors PacketPipeline) so that
-        # newly-decoded messages get their channel_name set.
-        channel_name_by_idx = {
-            ch["idx"]: ch["name"] for ch in self._store.list_channels()
+        # Build channel-name → idx lookup (mirrors PacketPipeline) so
+        # that newly-decoded messages get a current ``Message.channel``
+        # idx for display.  ``channel_name`` is the identity.
+        channels = self._store.list_channels()
+        idx_by_name: Dict[str, int] = {
+            ch.get("name", ""): ch.get("idx")
+            for ch in channels
+            if ch.get("name")
         }
+
+        # Fetch the domca-API ranking once per job and freeze it
+        # (ontwerp §6.1).  The frozen list is name-based; a watchlist
+        # mutation during the job has no effect on this list — that
+        # is precisely the property ADR-001 buys us.  An empty list
+        # (network failure / malformed payload) means "use decoder
+        # default order" — recorded as fallback in the job status so
+        # the GUI surfaces the degraded mode.
+        priority_name_order = fetch_priority_name_order(channels)
+        if priority_name_order:
+            job.priority_source = "domca"
+        else:
+            job.priority_source = "fallback"
+        debug_print(
+            f"ArchiveRescanner: priority list "
+            f"({job.priority_source}, {len(priority_name_order)} entries)"
+        )
 
         # Pre-load full-archive dedup sets — one read per file,
         # one set lookup per line.
@@ -457,15 +765,50 @@ class ArchiveRescanner:
         message_fps = archive.load_all_message_fingerprints()
         debug_print(
             f"ArchiveRescanner: starting job {job.job_id} "
-            f"(only_idx={job.only_channel_idx}, "
+            f"(only_channel_name={job.only_channel_name!r}, "
+            f"window={job.start_date}..{job.end_date}, "
             f"{len(rxlog_hashes)} rxlog hashes, "
             f"{len(message_fps)} message fingerprints loaded)"
         )
 
         # Discover files; populate progress entries up-front so the
         # GUI knows the totals immediately.
-        files = sorted(self._source_dir.glob("*_rxlog.jsonl"))
+        #
+        # meshcore-gui keeps two parallel rxlog files per device:
+        #   - ``*_rxlog.json``  : pretty-printed snapshot containing the
+        #                          full retained history (~7-8 days, can
+        #                          be 100+ MB)
+        #   - ``*_rxlog.jsonl`` : append-only line file with the most
+        #                          recent ~3 days
+        # Both contain records with the same schema; the .jsonl is
+        # typically a few minutes ahead of the .json (live writer vs
+        # periodic flush).  We process .json first so the older history
+        # lands first, then .jsonl picks up the recent records that the
+        # .json snapshot does not yet contain.  Overlap between the two
+        # is absorbed by the existing message_hash / fingerprint dedup
+        # sets — duplicates are recognised as already-archived and
+        # skipped without producing extra rows.
+        files = sorted(self._source_dir.glob("*_rxlog.json"))
+        files += sorted(self._source_dir.glob("*_rxlog.jsonl"))
+
+        # Filename-skip layer (template 2, mechanism 2).  Whole files
+        # whose name embeds a YYYY-MM-DD outside the window are
+        # dropped before opening — dramatically faster than scanning
+        # them line-by-line on a multi-day archive.  Files without an
+        # unambiguous date in the name (notably the ``*_rxlog.json``
+        # snapshot) fall through to record-level filtering.
+        eligible: List[Path] = []
         for path in files:
+            if _filename_window_skip(path.name, window_start, window_end):
+                job.skipped_files += 1
+                debug_print(
+                    f"ArchiveRescanner: filename-skip {path.name} "
+                    f"(outside {window_start}..{window_end})"
+                )
+                continue
+            eligible.append(path)
+
+        for path in eligible:
             try:
                 size = path.stat().st_size
             except OSError:
@@ -479,9 +822,12 @@ class ArchiveRescanner:
                     Path(fp.path),
                     fp,
                     job,
-                    channel_name_by_idx,
+                    idx_by_name,
                     rxlog_hashes,
                     message_fps,
+                    window_start,
+                    window_end,
+                    priority_name_order,
                 )
             except Exception as exc:
                 # Log and continue to the next file: a corrupted file
@@ -500,9 +846,14 @@ class ArchiveRescanner:
         job.status = RescanStatus.DONE
         debug_print(
             f"ArchiveRescanner: job {job.job_id} done "
-            f"(new_messages={job.new_messages}, "
+            f"(decoded_total={job.decoded_total}, "
+            f"new_messages={job.new_messages}, "
+            f"skipped_dup_message={job.skipped_dup_message}, "
+            f"not_decryptable={job.not_decryptable}, "
             f"new_rxlog={job.new_rxlog}, "
             f"skipped_dup_rxlog={job.skipped_dup_rxlog}, "
+            f"skipped_window={job.skipped_window}, "
+            f"skipped_files={job.skipped_files}, "
             f"decode_failures={job.decode_failures})"
         )
 
@@ -515,9 +866,84 @@ class ArchiveRescanner:
         path: Path,
         progress: FileProgress,
         job: RescanJob,
-        channel_name_by_idx: Dict[int, str],
+        idx_by_name: Dict[str, int],
         rxlog_hashes: set,
         message_fps: set,
+        window_start: _date,
+        window_end: _date,
+        priority_name_order: List[str],
+    ) -> None:
+        """Dispatch to the right parser based on file format.
+
+        meshcore-gui writes two formats with the same record schema
+        but different containers:
+
+          - ``.jsonl``   one record per line, append-only
+          - ``.json``    pretty-printed object with an ``entries``
+                         array, periodically flushed snapshot
+
+        Both must be read because the two files cover different
+        windows (the .jsonl is typically minutes ahead of the .json,
+        but the .json reaches further back).  Format is determined
+        from the first non-whitespace byte rather than the extension
+        alone, so a renamed or atypically-named file is still parsed
+        correctly.
+        """
+        try:
+            is_pretty = self._is_pretty_printed(path)
+        except OSError as exc:
+            debug_print(
+                f"ArchiveRescanner: cannot peek {path.name}: {exc}"
+            )
+            progress.bytes_done = progress.bytes_total
+            return
+
+        if is_pretty:
+            self._process_pretty_json_file(
+                path, progress, job, idx_by_name,
+                rxlog_hashes, message_fps,
+                window_start, window_end, priority_name_order,
+            )
+        else:
+            self._process_jsonl_file(
+                path, progress, job, idx_by_name,
+                rxlog_hashes, message_fps,
+                window_start, window_end, priority_name_order,
+            )
+
+    @staticmethod
+    def _is_pretty_printed(path: Path) -> bool:
+        """Detect whether *path* is pretty-printed JSON or JSONL.
+
+        Both formats start with ``{``, so the first byte alone is not
+        sufficient.  Distinguishing feature: pretty-printed JSON has a
+        newline immediately after the top-level opening brace
+        (``"{\\n  ..."``), whereas JSONL records pack a full record
+        onto one line (``'{"time":...}'``).
+
+        Reads at most a handful of bytes — safe on multi-GB files.
+        Returns ``False`` for empty files (defaults to JSONL handling,
+        which is a safe no-op on an empty file).
+        """
+        with path.open("rb") as f:
+            head = f.read(8)
+        idx = head.find(b"{")
+        if idx < 0 or idx + 1 >= len(head):
+            return False
+        next_byte = head[idx + 1:idx + 2]
+        return next_byte in (b"\n", b"\r")
+
+    def _process_jsonl_file(
+        self,
+        path: Path,
+        progress: FileProgress,
+        job: RescanJob,
+        idx_by_name: Dict[str, int],
+        rxlog_hashes: set,
+        message_fps: set,
+        window_start: _date,
+        window_end: _date,
+        priority_name_order: List[str],
     ) -> None:
         """Stream one ``*_rxlog.jsonl`` from byte 0 to EOF.
 
@@ -545,14 +971,142 @@ class ArchiveRescanner:
                     rec,
                     path,
                     job,
-                    channel_name_by_idx,
+                    idx_by_name,
                     rxlog_hashes,
                     message_fps,
+                    window_start,
+                    window_end,
+                    priority_name_order,
                 )
 
         # Pin progress to the recorded total in case the file grew
         # during the rescan (live tailer is still writing).  We do not
         # follow that growth — the live tailer will pick it up.
+        progress.bytes_done = progress.bytes_total
+
+    def _process_pretty_json_file(
+        self,
+        path: Path,
+        progress: FileProgress,
+        job: RescanJob,
+        idx_by_name: Dict[str, int],
+        rxlog_hashes: set,
+        message_fps: set,
+        window_start: _date,
+        window_end: _date,
+        priority_name_order: List[str],
+    ) -> None:
+        """Stream records from a meshcore-gui pretty-printed rxlog file.
+
+        File structure (relevant excerpt)::
+
+            {
+              "version": 1,
+              "address": "...",
+              "last_updated": "...",
+              "entries": [
+                {
+                  "time": "...",
+                  "timestamp_utc": "...",
+                  ...
+                  "path_hashes": [...],
+                  "path_names": [...],
+                  ...
+                },
+                {
+                  ...
+                }
+              ]
+            }
+
+        We could not use ``json.load()`` here because these files
+        regularly exceed 150 MB, and loading the full DOM would peak
+        at well over a gigabyte of resident memory on a Pi.
+
+        Instead we lean on meshcore-gui's stable pretty-print
+        indentation: every record begins with exactly ``"    {"``
+        (four spaces + opening brace) and ends with ``"    }"`` or
+        ``"    },"`` on its own line.  Lines between those markers
+        are accumulated and parsed with a single ``json.loads`` call.
+        Nested objects and arrays inside a record (e.g. ``path_hashes``)
+        sit at deeper indents and never collide with the record
+        delimiters.
+
+        Failure modes handled:
+
+          - Truncated trailing record (file is being written while we
+            read): caught by the json.loads except branch, counted as
+            a decode failure, rescan continues.
+          - Indentation regression (meshcore-gui changes its writer):
+            records are not detected and the file yields zero records.
+            That manifests as a per-file decode_failures bump of zero
+            and ``new_*`` deltas of zero — visible in the GUI's job
+            summary, so the regression is observable.
+
+        Byte progress is updated per line.
+        """
+        in_entries = False
+        in_record = False
+        buffer: List[str] = []
+
+        with path.open("rb") as f:
+            for raw_line in f:
+                progress.bytes_done += len(raw_line)
+
+                try:
+                    line = raw_line.decode("utf-8")
+                except UnicodeDecodeError:
+                    # Pretty-print files should be ASCII-safe but be
+                    # defensive against an occasional bad byte.
+                    job.decode_failures += 1
+                    continue
+
+                stripped = line.rstrip("\n").rstrip("\r")
+
+                if not in_entries:
+                    # Skip past header until we hit the entries-array
+                    # opener.  Test against the rstrip'ed line so a
+                    # trailing CR on Windows-touched files doesn't
+                    # break detection.
+                    if stripped.endswith('"entries": ['):
+                        in_entries = True
+                    continue
+
+                if not in_record:
+                    if stripped == "    {":
+                        in_record = True
+                        buffer = ["{"]
+                    # else: closing ']' of entries array, trailing
+                    # post-entries keys (closing '}' of the outer
+                    # object), or whitespace — all safely ignored.
+                else:
+                    if stripped == "    }" or stripped == "    },":
+                        buffer.append("}")
+                        try:
+                            rec = json.loads("\n".join(buffer))
+                        except json.JSONDecodeError:
+                            job.decode_failures += 1
+                            in_record = False
+                            buffer = []
+                            continue
+
+                        in_record = False
+                        buffer = []
+
+                        self._handle_line(
+                            rec,
+                            path,
+                            job,
+                            idx_by_name,
+                            rxlog_hashes,
+                            message_fps,
+                            window_start,
+                            window_end,
+                            priority_name_order,
+                        )
+                    else:
+                        buffer.append(stripped)
+
         progress.bytes_done = progress.bytes_total
 
     # ------------------------------------------------------------------
@@ -564,9 +1118,12 @@ class ArchiveRescanner:
         rec: Dict,
         file_path: Path,
         job: RescanJob,
-        channel_name_by_idx: Dict[int, str],
+        idx_by_name: Dict[str, int],
         rxlog_hashes: set,
         message_fps: set,
+        window_start: _date,
+        window_end: _date,
+        priority_name_order: List[str],
     ) -> None:
         """Process a single historical RX log record.
 
@@ -578,12 +1135,39 @@ class ArchiveRescanner:
         the record / filename / mtime via :func:`derive_record_timestamp_utc`
         and passed through to the ingest methods so the archive row
         carries the historical time, not the rescan moment.
+
+        Window filtering (template 2, mechanism 2): records whose
+        recovered timestamp falls outside ``[window_start,
+        window_end]`` early-return *before* the decoder loop, which
+        is the expensive part on a 426-channel watchlist.  The skip
+        is counted on ``job.skipped_window`` so the operator can
+        verify the filter actually fired.
+
+        Counter logic (ontwerp 0.2.6 §5.4):
+
+          - ``decoder.decode(...)`` returns ``None`` (structural
+            failure or scoped to absent name) → ``decode_failures += 1``
+          - Not GroupText                      → no counter
+          - ``is_decrypted == False``          → ``not_decryptable += 1``
+          - Decoded GroupText, dup fingerprint → ``decoded_total += 1``,
+                                                 ``skipped_dup_message += 1``
+          - Decoded GroupText, new fingerprint → ``decoded_total += 1``,
+                                                 ``new_messages += 1``
         """
         raw_payload = rec.get("raw_payload") or ""
 
         # Recover the original arrival time once per record and reuse
         # it for both the rxlog and the message rows so they line up.
         ts_utc = derive_record_timestamp_utc(rec, file_path)
+
+        # Recordniveau-window-filter (template 2, mechanism 2).
+        # Early-return *before* dedup-set lookup, archive write, AND
+        # the O(N_channels) decode loop.  That last point is what
+        # makes this filter pay off: a record outside the window
+        # avoids the multi-key trial decryption entirely.
+        if not _record_in_window(ts_utc, window_start, window_end):
+            job.skipped_window += 1
+            return
 
         rx_entry = RxLogEntry(
             time=rec.get("time", ""),
@@ -620,17 +1204,36 @@ class ArchiveRescanner:
 
         decoded = self._decoder.decode(
             raw_payload,
-            allowed_idx=job.only_channel_idx,
+            allowed_name=job.only_channel_name,
+            priority_name_order=priority_name_order or None,
         )
-        if decoded is None or not decoded.is_decrypted:
+        if decoded is None:
+            # Structural failure, or scoped to a name the decoder
+            # doesn't have a key for (channel deleted between submit
+            # and worker pickup).  Per §5.4 this counts as a decode
+            # failure — the same bucket the live tailer uses for
+            # malformed packets.
+            job.decode_failures += 1
             return
-        if decoded.channel_idx is None:
+
+        # Not-GroupText: no counter, just early-return.  The rxlog row
+        # is already persisted; non-GroupText packets are not message
+        # candidates by design.
+        if decoded.payload_type != PayloadType.GroupText:
             return
+
+        if not decoded.is_decrypted:
+            job.not_decryptable += 1
+            return
+
+        # Successful GroupText decode — bump decoded_total then split
+        # on dedup outcome.
+        job.decoded_total += 1
 
         msg = Message.incoming(
             sender=decoded.sender,
             text=decoded.text,
-            channel=decoded.channel_idx,
+            channel=idx_by_name.get(decoded.channel_name),
             time=rx_entry.time,
             snr=rx_entry.snr,
             path_len=decoded.path_length,
@@ -638,11 +1241,11 @@ class ArchiveRescanner:
             path_names=rx_entry.path_names,
             message_hash=decoded.message_hash,
         )
-        ch_name = channel_name_by_idx.get(decoded.channel_idx, "")
-        if ch_name:
-            msg.channel_name = ch_name
+        msg.channel_name = decoded.channel_name
 
         if self._shared.ingest_rescanned_message(
             msg, message_fps, timestamp_utc=ts_utc,
         ):
             job.new_messages += 1
+        else:
+            job.skipped_dup_message += 1

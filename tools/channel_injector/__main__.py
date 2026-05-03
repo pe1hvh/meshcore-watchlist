@@ -188,8 +188,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "run complete: %s", result.summary_line()
     )
 
+    # When channels were actually added, surface their names at
+    # WARNING level too — that way a default-verbosity cron run shows
+    # *what* was added, not just the count.  Stays silent on no-op
+    # runs (added is empty), so quiet runs remain quiet.
     if result.added:
-        log.info("added: %s", ", ".join(result.added))
+        log.warning("added: %s", ", ".join(result.added))
     if result.skipped_existing:
         log.info("already present: %s", ", ".join(result.skipped_existing))
     if result.skipped_invalid:

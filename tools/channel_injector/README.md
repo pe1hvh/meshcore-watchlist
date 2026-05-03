@@ -67,8 +67,21 @@ Uitvoeren als module:
 Per run wordt op WARNING-niveau één samenvattings-regel gelogd zoals:
 
 ```
-channel_injector: run complete: added=2 skipped_existing=5 skipped_invalid=0 rescans=2 source_errors=0 daemon_error=no
+channel_injector: run complete: added=2 skipped_existing=5 skipped_invalid=0 rescans=2 source_errors=0 daemon_error=no max_adds_reached=no
 ```
+
+Wanneer er één of meer kanalen zijn toegevoegd, volgt een tweede
+WARNING-regel met de namen — zo zie je op default cron-verbosity
+direct **wat** er is toegevoegd, niet alleen het aantal:
+
+```
+channel_injector.cli: added: #ruche, #ping
+```
+
+Op runs zonder toevoegingen blijft het bij die ene samenvattingsregel
+(stille runs blijven stil). De overige post-run-regels
+(`already present`, `skipped`) staan op INFO en zijn alleen zichtbaar
+met `-v`.
 
 ## Cron versus systemd-service
 

@@ -5,6 +5,53 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.2] - 2026-05-03
+
+Tiny UX fix on top of 0.3.1: the channel injector's default-verbosity
+cron output now shows *which* channels were added, not just the
+count.
+
+### Changed
+
+- **``tools/channel_injector/__main__.py``** — when
+  ``result.added`` is non-empty, the post-run ``added: <names>``
+  line is logged at ``WARNING`` instead of ``INFO``.  Default
+  cron-verbosity (no ``-v``) therefore now produces two lines on a
+  successful add-run:
+
+  ```
+  WARNING channel_injector: run complete: added=2 skipped_existing=1 ...
+  WARNING channel_injector.cli: added: #ruche, #ping
+  ```
+
+  Runs with ``added=0`` stay single-line as before — quiet runs
+  remain quiet.  All other post-run lines (``already present``,
+  ``skipped``) stay on ``INFO`` so they only surface with ``-v``.
+
+- **Version bump** ``0.3.1`` → ``0.3.2`` (PATCH — log-level change
+  only, no API or behaviour change).
+
+### IMPACT
+
+- Operators reading ``/var/log/channel_injector.log`` (or the cron
+  mail) can answer "what got added on the last run" without raising
+  the verbosity level.  No more round-trips through
+  ``watchlist.json`` or the GUI for that single question.
+- No code path changes, no API change, no schema change.  The ZIP
+  delivered for this iteration is functionally identical to 0.3.1
+  except for the one log-level edit and the version strings.
+
+### RATIONALE
+
+In 0.3.1 the per-run summary line on cron-default verbosity told you
+that *N* channels were added but not *which*.  Operators following
+the suggested "elke 15 min" cadence read the cron mail or the
+appended logfile; raising verbosity globally (``-v``) to learn the
+names would have flooded those logs with start-up lines and
+window-bounds noise.  Promoting just the ``added``-names line to
+WARNING is the smallest change that fixes the question without
+adding noise to no-op runs.
+
 ## [0.3.1] - 2026-05-03
 
 Hardening of the 0.3.0 channel-injection path.  The injector and the

@@ -5,6 +5,70 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.4] - 2026-05-03
+
+Bugfix in the channel injector: a multi-channel run no longer wastes
+its rescan submissions on the daemon's single-job rescan slot.
+
+### Fixed
+
+- **Channel injector: only the first newly-added channel got
+  rescanned, the rest got `HTTP 409 rescan_busy`.** The injector
+  fired one `POST /api/v1/rescan/by-name` per added channel, but the
+  daemon's `RescanJobManager` is single-job by design (ontwerp
+  0.2.6 §9.2 — "geen queue"): the second submit while the first is
+  still running raises `RescanBusyError`, which the REST layer
+  surfaces as `HTTP 409`. With seven new channels in one cron run
+  the result was `rescans=1` and six warnings — six channels added
+  whose archive packets stayed undecoded until a manual rescan.
+
+### Changed
+
+- **`tools/channel_injector/injector.py`** — replaced the per-channel
+  rescan inside the add-loop with a single batched
+  `POST /api/v1/rescan` over the same UTC day-window after every add
+  has happened. The decoder tries every registered key (incl. the
+  freshly-added ones) on the full archive; existing-channel records
+  are absorbed by the message-archive fingerprint dedup downstream
+  so the full rescan does no extra writes for them.
+- **`tools/channel_injector/injector.py`** — added
+  `WatchlistClient.rescan_full(start_date, end_date)`. The existing
+  `rescan_by_name(name, start_date, end_date)` is kept on the public
+  client surface for ad-hoc / test callers; the run-loop no longer
+  uses it.
+- **Version bump** `0.3.3` → `0.3.4` (PATCH — bugfix, no API change
+  on the daemon side; injector public surface stays
+  backward-compatible: `InjectorResult` shape unchanged,
+  `summary_line()` shape unchanged, `rescans_submitted` keeps its
+  per-name list semantics — every newly-added channel covered by the
+  single batched rescan is listed there).
+
+### IMPACT
+
+- Cron operators see all newly-added channels rescanned in one job
+  instead of just the first; the post-run summary line now reports
+  `rescans=N` matching `added=N` on the success path. Existing
+  workflows that scrape this summary line keep working — counts
+  match `len(added)` instead of being capped at 1 by the 409s.
+- A user-triggered rescan running concurrently with the cron still
+  produces a single `HTTP 409` warning at the very end of the run
+  rather than one per added channel — quieter logs, same outcome
+  (operator can re-trigger when the slot is free).
+
+### RATIONALE
+
+The shortest working fix that respects the daemon's existing
+single-job invariant. Submitting one full-window rescan instead of
+N per-channel ones avoids the queueing problem entirely without
+adding state on either side: no polling loop on
+`GET /api/v1/rescan/{job_id}`, no client-side queue, no server-side
+job queue. The full-rescan path is the same one the GUI's
+"Rescan all" button drives, so behaviour is consistent with the
+already-tested code path. Per-channel rescans remain available
+through `WatchlistClient.rescan_by_name` for callers that genuinely
+want one (tests, ad-hoc tooling) — the public surface is
+preserved.
+
 ## [0.3.3] - 2026-05-03
 
 Cloudflare-friendliness fix on the injector: the source-URL fetch now

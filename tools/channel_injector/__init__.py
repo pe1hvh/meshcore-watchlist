@@ -10,4 +10,4 @@ Designed to run as a cron job in the same virtualenv as the daemon.
 See ``tools/channel_injector/README.md`` for installation and usage.
 """
 
-__version__ = "0.3.2"
+__version__ = "0.3.3"

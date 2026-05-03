@@ -5,6 +5,37 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.3] - 2026-05-03
+
+Cloudflare-friendliness fix on the injector: the source-URL fetch now
+sends an explicit User-Agent.
+
+### Fixed
+
+- **HTTP 403 on Cloudflare-fronted source URLs** — Python's default
+  ``Python-urllib/<version>`` User-Agent is on Cloudflare's
+  anti-bot blocklist, which broke legitimate polling of e.g.
+  ``https://cornmeister.nl/api/channels``.
+  ``tools/channel_injector/injector.py::_http_get_json`` now sends
+  ``User-Agent: meshcore-watchlist-channel-injector/<version>``.
+  Both diagnoses the issue (source operator can identify the caller)
+  and resolves it (Cloudflare's default rules pass an identified
+  client).
+
+### Changed
+
+- **Version bump** ``0.3.2`` → ``0.3.3`` (PATCH — single header
+  added, no behaviour or API change).
+
+### RATIONALE
+
+A fixed identifying UA is preferable to either (a) leaving the
+default which is filterable, or (b) impersonating a browser which
+would be dishonest to the upstream operator.  Identifying ourselves
+by name and version means a future cornmeister-side rate limit or
+abuse-block can target this client specifically without affecting
+unrelated traffic.
+
 ## [0.3.2] - 2026-05-03
 
 Tiny UX fix on top of 0.3.1: the channel injector's default-verbosity

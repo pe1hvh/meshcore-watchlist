@@ -136,9 +136,21 @@ def _http_get_json(
     server is still sending after that, :class:`ResponseTooLarge` is
     raised and the connection is closed.  This prevents a runaway or
     misbehaving upstream from forcing us to allocate hundreds of MB.
+
+    Sends an explicit User-Agent identifying this tool and version.
+    Python's default ``Python-urllib/...`` is on Cloudflare's
+    anti-bot blocklist by default, which 403s legitimate JSON
+    polling.  Identifying ourselves also lets the source operator
+    see in their access log who is polling, and rate-limit if they
+    wish.
     """
+    from tools.channel_injector import __version__ as _ver
     req = urllib.request.Request(url, method="GET")
     req.add_header("Accept", "application/json")
+    req.add_header(
+        "User-Agent",
+        f"meshcore-watchlist-channel-injector/{_ver}",
+    )
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         # read(n) returns up to n bytes.  We ask for max_bytes + 1 to
         # detect overflow: if the response is exactly max_bytes long

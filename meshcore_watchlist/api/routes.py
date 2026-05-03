@@ -15,6 +15,16 @@ Plus the rescan control-plane endpoints:
     POST /api/v1/rescan/by-name      → submit per-channel rescan (0.2.6)
     GET  /api/v1/rescan/{job_id}     → job status
 
+Plus the watchlist mutation endpoint (0.3.0, additive):
+
+    POST /api/v1/channels            → add a hashtag channel to the watchlist
+
+This is the single API entry point through which an out-of-process
+client (e.g. ``tools.channel_injector``) can grow the watchlist without
+violating the "WatchlistStore is the only mutator" invariant from
+``CLAUDE.md``: the daemon still owns the store, the client merely
+asks it to add a name.
+
 Compared to 0.2.5 the per-channel rescan moved from
 ``POST /api/v1/rescan/{idx}`` to
 ``POST /api/v1/rescan/by-name?channel_name=...`` per ADR-001:
@@ -29,13 +39,13 @@ Call :func:`register_routes` once from ``main.py`` after
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Optional
 
 from fastapi import HTTPException, Query
 from fastapi.responses import JSONResponse
 from nicegui import app as _nicegui_app
 
-from meshcore_watchlist.config import debug_print
+from meshcore_watchlist.config import debug_print, is_public_channel_name
 from meshcore_watchlist.services.archive_rescanner import (
     InvalidRescanWindow,
     RescanBusyError,
@@ -47,10 +57,12 @@ from meshcore_watchlist.services.public_api_service import (
     get_nodes_payload,
     get_stats_payload,
 )
+from meshcore_watchlist.services.watchlist_store import CHANNEL_NAME_MAX_BYTES
 
 if TYPE_CHECKING:
     from meshcore_watchlist.core.shared_data import SharedData
     from meshcore_watchlist.services.archive_rescanner import RescanJobManager
+    from meshcore_watchlist.services.watchlist_store import WatchlistStore
 
 
 # CORS: same defaults as meshcore-gui.  Override via env if needed.
@@ -74,6 +86,7 @@ def _cors_response(data: Any) -> JSONResponse:
 def register_routes(
     shared: "SharedData",
     rescan_manager: "RescanJobManager",
+    store: "Optional[WatchlistStore]" = None,
 ) -> None:
     """Wire public API routes into the NiceGUI/FastAPI application.
 
@@ -82,6 +95,10 @@ def register_routes(
             endpoints.
         rescan_manager: Rescan job manager backing the control-plane
             ``/api/v1/rescan*`` endpoints.
+        store: Watchlist store backing ``POST /api/v1/channels``.  When
+            omitted the channel-add endpoint is simply not registered —
+            this preserves backward compatibility with any caller that
+            still uses the 0.2.x two-argument signature.
     """
 
     @_nicegui_app.get(
@@ -264,8 +281,115 @@ def register_routes(
             )
         return _cors_response(job.to_dict())
 
+    # ------------------------------------------------------------------
+    # Watchlist mutation (additive, 0.3.0)
+    # ------------------------------------------------------------------
+
+    if store is not None:
+
+        @_nicegui_app.post(
+            "/api/v1/channels",
+            tags=["MeshCore Watchlist Public API"],
+            summary="Add a hashtag channel to the watchlist",
+            response_class=JSONResponse,
+        )
+        async def api_channels_add(
+            name: str = Query(
+                default="",
+                description=(
+                    "Channel name to add (e.g. \"#test\"). URL-encode "
+                    "'#' as '%23'.  A leading '#' is enforced server-"
+                    "side if missing.  Public is system-managed: a "
+                    "request for it returns 200 with added=false. "
+                    "Empty / missing → 400."
+                ),
+            ),
+        ) -> JSONResponse:
+            # Reject empty / whitespace-only names with a structured
+            # 400 before doing anything else.
+            cleaned = name.strip() if name else ""
+            if not cleaned:
+                raise HTTPException(
+                    status_code=400,
+                    detail={"error": "missing_name"},
+                )
+
+            # Defence against header / log injection: refuse any name
+            # containing CR/LF or other control characters.  Channel
+            # names are short printable strings; anything else is an
+            # attack surface we don't need.
+            if any(ord(c) < 0x20 or ord(c) == 0x7F for c in cleaned):
+                raise HTTPException(
+                    status_code=400,
+                    detail={"error": "invalid_name"},
+                )
+
+            # Per ADR-007: enforce the MeshCore Companion Protocol's
+            # 32-byte UTF-8 limit on the channel name field.  Length
+            # is in bytes, not codepoints.  We check against the
+            # name as the operator submitted it; WatchlistStore.add
+            # may add a leading '#' on top, but that one byte is
+            # accounted for by the strict-less-than-or-equal-to-32
+            # boundary together with the post-prefix re-check inside
+            # the store.
+            cleaned_bytes = len(cleaned.encode("utf-8"))
+            # Account for a possible '#' that the store will prepend
+            # for non-Public, non-hashtag input — that costs 1 byte
+            # on the wire.  Public is handled below before we get
+            # here in the long-name path, so this check is
+            # conservative for all other inputs.
+            effective_bytes = cleaned_bytes + (
+                0 if cleaned.startswith("#") or is_public_channel_name(cleaned)
+                else 1
+            )
+            if effective_bytes > CHANNEL_NAME_MAX_BYTES:
+                raise HTTPException(
+                    status_code=400,
+                    detail={
+                        "error": "name_too_long",
+                        "max_bytes": CHANNEL_NAME_MAX_BYTES,
+                        "got_bytes": effective_bytes,
+                    },
+                )
+
+            # Public is system-managed and always present at idx 0.
+            # Surface that as a no-op success rather than a duplicate
+            # error: the client's intent ("make sure this name is on
+            # the watchlist") is satisfied.
+            if is_public_channel_name(cleaned):
+                return JSONResponse(
+                    status_code=200,
+                    content={
+                        "name": "Public",
+                        "added": False,
+                        "reason": "public_is_system_managed",
+                    },
+                )
+
+            # WatchlistStore.add() enforces the leading '#', persists
+            # the file, and notifies subscribers (decoder key map,
+            # GUI, …) — exactly what we want.  Returns False only for
+            # duplicates (already on the list).
+            added = store.add(cleaned)
+            normalised = cleaned if cleaned.startswith("#") else "#" + cleaned
+
+            if added:
+                return JSONResponse(
+                    status_code=201,
+                    content={"name": normalised, "added": True},
+                )
+            return JSONResponse(
+                status_code=200,
+                content={
+                    "name": normalised,
+                    "added": False,
+                    "reason": "already_on_watchlist",
+                },
+            )
+
     debug_print(
         "Public API registered: /api/v1/stats, /api/v1/nodes, "
-        "/api/v1/messages, /api/v1/channels, "
+        "/api/v1/messages, /api/v1/channels (GET" +
+        (" + POST" if store is not None else "") + "), "
         "/api/v1/rescan (POST full + by-name, GET status)"
     )

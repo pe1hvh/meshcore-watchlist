@@ -1,0 +1,32 @@
+# channel_injector.cron.example
+#
+# Sample crontab entry for tools/channel_injector.  Copy-paste into
+# the crontab of the same user that runs the meshcore-watchlist
+# daemon (so the venv is reachable and ownership of any log file is
+# consistent).  Edit the URL(s) and schedule to taste.
+#
+# Install:
+#     crontab -e          # as the meshcore-watchlist run-user
+# Or system-wide:
+#     sudo install -m 0644 \
+#         install_script/channel_injector.cron.example \
+#         /etc/cron.d/meshcore-watchlist-channel-injector
+#     # Then prepend "USER " before the schedule on each line for
+#     # /etc/cron.d/ — see crontab(5) on your distro.
+#
+# Notes
+# -----
+# * Use the FULL PATH to the venv's python.  cron has a minimal
+#   environment and there is no shell activation; a bare "python"
+#   may resolve to the wrong interpreter or none at all.
+# * The "cd" puts the install dir on sys.path so the
+#   "tools.channel_injector" package import resolves.
+# * --source-url may be repeated to merge multiple upstream lists.
+# * Stdout + stderr are appended to a logfile so cron's mail-on-
+#   output behaviour stays quiet on success.
+
+# Every 15 minutes, sync the upstream channel list.
+*/15 * * * * cd /opt/meshcore-watchlist && /opt/meshcore-watchlist/.venv/bin/python -m tools.channel_injector --source-url https://example.org/channels.json >> /var/log/channel_injector.log 2>&1
+
+# Example with two upstream sources and INFO logging:
+# */30 * * * * cd /opt/meshcore-watchlist && /opt/meshcore-watchlist/.venv/bin/python -m tools.channel_injector -v --source-url https://example.org/channels.json --source-url https://other.example/list.json >> /var/log/channel_injector.log 2>&1

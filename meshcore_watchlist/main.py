@@ -244,7 +244,7 @@ def main() -> None:
     build_dashboard(shared=shared, store=store, rescan_manager=rescan_manager)
 
     # Public REST API (/api/v1/...)
-    register_routes(shared, rescan_manager=rescan_manager)
+    register_routes(shared, rescan_manager=rescan_manager, store=store)
 
     # NiceGUI run.  ``reload=False`` because we manage long-lived
     # background threads (the tailer) and reload would orphan them.

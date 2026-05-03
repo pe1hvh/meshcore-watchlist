@@ -71,12 +71,14 @@ other hosts on the LAN. Restrict with a firewall if undesired.
 
 Base URL: `http://<host>:<port>/api/v1`
 
-| Endpoint    | Description                                              |
-|-------------|----------------------------------------------------------|
-| `/channels` | Channels currently being monitored (the watchlist)       |
-| `/messages` | Decoded public + hashtag messages, paginated             |
-| `/stats`    | Aggregated counts over the last 72 hours                 |
-| `/nodes`    | Always `[]` — watchlist has no contact list of its own   |
+| Endpoint           | Method | Description                                              |
+|--------------------|--------|----------------------------------------------------------|
+| `/channels`        | GET    | Channels currently being monitored (the watchlist)       |
+| `/channels`        | POST   | Add a hashtag channel (used by `tools/channel_injector`) |
+| `/messages`        | GET    | Decoded public + hashtag messages, paginated             |
+| `/stats`           | GET    | Aggregated counts over the last 72 hours                 |
+| `/nodes`           | GET    | Always `[]` — watchlist has no contact list of its own   |
+| `/rescan/by-name`  | POST   | Submit a per-channel rescan over an explicit date window |
 
 ### `GET /channels`
 
@@ -161,6 +163,53 @@ curl -s "http://$HOST:$PORT/api/v1/messages?limit=100&offset=100" | jq
 When persisting messages downstream, dedupe on a content key such as
 `(timestamp, sender_pubkey, text)` rather than on `id` — `id` is a
 positional index within a single response, not a stable primary key.
+
+### `POST /channels`
+
+Adds a hashtag channel to the watchlist. Additive endpoint introduced
+in 0.3.0 so out-of-process clients (notably `tools/channel_injector`)
+can grow the watchlist without violating the "`WatchlistStore` is the
+only mutator" invariant: the daemon still owns the store, the client
+merely asks it to add a name.
+
+| Param  | Type   | Required | Notes                                       |
+|--------|--------|----------|---------------------------------------------|
+| `name` | string | yes      | Channel name. URL-encode `#` as `%23`.      |
+
+Status codes:
+
+| Code | Meaning                                                            |
+|------|--------------------------------------------------------------------|
+| 201  | Channel added.                                                     |
+| 200  | Already on the watchlist (or `Public`, which is system-managed).   |
+| 400  | Empty / control-character / over-32-byte UTF-8 name.               |
+
+Channel names are limited to 32 UTF-8 bytes per the MeshCore Companion
+Protocol; see ADR-007 for the rationale. Length is in **bytes**, not
+codepoints (`#café` is 6 bytes, not 5).
+
+```bash
+curl -X POST "http://localhost:8083/api/v1/channels?name=%23weather"
+# → 201 {"name": "#weather", "added": true}
+```
+
+## Channel injector (cron-driven seeder)
+
+`tools/channel_injector` is a small standalone script that fetches one
+or more upstream channel listings (JSON over HTTP) and seeds any
+missing hashtag channels into the running daemon, then triggers a
+per-channel rescan over the last 7 days. It is intended to run
+periodically from cron, in the daemon's own venv. No extra
+dependencies.
+
+See [`tools/channel_injector/README.md`](tools/channel_injector/README.md)
+for the full reference and [`install_script/channel_injector.cron.example`](install_script/channel_injector.cron.example)
+for a sample crontab entry. Quick start:
+
+```bash
+/opt/meshcore-watchlist/.venv/bin/python -m tools.channel_injector \
+    --source-url https://example.org/channels.json
+```
 
 ## Configuration
 

@@ -5,6 +5,172 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.1] - 2026-05-03
+
+Hardening of the 0.3.0 channel-injection path.  The injector and the
+``POST /api/v1/channels`` endpoint now enforce the protocol-bounded
+length of a MeshCore channel name and add two pragmatic safety caps
+against a misbehaving external source.  No breaking changes for
+well-formed clients.
+
+### Added
+
+- **ADR-007** — *Channel-name length and charset are bounded by the
+  MeshCore Companion Protocol* (Accepted, 2026-05-03).  Establishes
+  32 UTF-8 bytes as the universal limit, with rejection of ASCII
+  control characters as the only charset rule.  See
+  ``docs/adr/ADR-007-channel-name-length-and-charset.md``.
+- **Daemon error ``name_too_long``** — ``POST /api/v1/channels``
+  returns HTTP 400 with
+  ``{"error": "name_too_long", "max_bytes": 32, "got_bytes": N}``
+  for names whose UTF-8 encoding exceeds 32 bytes (after server-side
+  ``#``-prefix where applicable).
+- **Constant ``CHANNEL_NAME_MAX_BYTES = 32``** in
+  ``services/watchlist_store.py`` (and re-imported in ``api/routes.py``
+  and ``tools/channel_injector/injector.py``) — single source of
+  truth for the protocol-bounded limit, citing ADR-007 inline.
+- **Injector flags ``--max-source-bytes`` and
+  ``--max-adds-per-run``** — two pragmatic safety caps with
+  defaults 1 MiB and 50 respectively.  Both configurable per run.
+- **Injector field ``InjectorResult.max_adds_reached``** plus
+  ``max_adds_reached=yes/no`` in the one-line summary, so cron
+  output makes it visible when a run hit the per-run cap.
+- **Injector exception ``ResponseTooLarge``** — raised when a source
+  response exceeds the byte cap; reported as a source error, run
+  continues with other URLs.
+
+### Changed
+
+- **``WatchlistStore.add()``** now rejects names whose UTF-8 length
+  exceeds 32 bytes (returning ``False``, same convention as duplicate
+  rejection).  This affects every entry path, not just the API: GUI
+  add and direct callers also see the cap.  Pre-existing entries in
+  ``watchlist.json`` that exceed the limit are loaded as-is — only
+  *new* mutations validate.  See ADR-007 §4 for the migration note.
+- **``tools/channel_injector/injector.py``** — ``_http_get_json``
+  gained a ``max_bytes`` parameter; ``_is_safe_channel_name`` is now
+  paired with a separate ``_is_within_protocol_length`` so the two
+  concerns are documented orthogonally.  Source fetches use the
+  configured ``max_source_bytes``; the daemon-side
+  ``GET /api/v1/channels`` uses a generous internal ceiling because
+  it is a trusted local endpoint.
+- **Version bump** ``0.3.0`` → ``0.3.1`` (PATCH — additive
+  hardening, no breaking changes for well-formed clients).
+
+### IMPACT
+
+- A channel name that cannot fit on the wire can no longer enter the
+  watchlist via API or GUI.  Existing on-disk entries that violate
+  the rule remain in place to avoid surprising operators; they are
+  effectively no-ops since no real device can produce matching
+  traffic.
+- A misbehaving or compromised external source that sends a
+  multi-megabyte payload no longer drains memory: the injector
+  stops reading at the configured ceiling.
+- An external source that suddenly produces hundreds of new names
+  per run no longer floods the watchlist; the injector stops adding
+  past ``--max-adds-per-run`` and surfaces the situation in the
+  summary.
+- No changes to JSONL archive schema, no changes to existing REST
+  shapes other than the new ``name_too_long`` error variant on the
+  already-additive ``POST /api/v1/channels`` endpoint.  Downstream
+  consumers (``meshcore-gui`` clients, ``domca.nl``) are unaffected.
+
+### RATIONALE
+
+The injector was discussed against a threat model where the source
+URL is on the public internet — that puts the bus between an
+untrusted actor and the daemon's ``WatchlistStore``.  Three concrete
+gaps existed against that model:
+
+1. No length cap — a malformed source could write arbitrarily long
+   strings into ``watchlist.json`` even though the protocol clearly
+   states the field is 32 bytes UTF-8.
+2. No response-size cap — a bug or attack could force the cron
+   process to allocate hundreds of MB.
+3. No per-run add cap — a transient upstream glitch could
+   single-shot hundreds of entries into the watchlist.
+
+The 32-byte limit is grounded in the MeshCore Companion Protocol
+(`CMD_SET_CHANNEL`, bytes 2-33 = "32 bytes, UTF-8, null-padded"),
+not chosen arbitrarily; it is captured in ADR-007 so future work has
+a stable reference.  The two operational caps (1 MiB / 50) are
+configurable defaults, not invariants — operators with different
+needs can tune them per cron entry.
+
+## [0.3.0] - 2026-05-03
+
+Adds an out-of-process pathway for seeding the watchlist from an
+upstream channel-listing source, without breaking the
+"``WatchlistStore`` is the only mutator" invariant.  See
+``tools/channel_injector/README.md`` for the operational story.
+
+### Added
+
+- **``POST /api/v1/channels?name=...``** — additive endpoint that
+  forwards a channel-add request to ``WatchlistStore.add()``.  Returns
+  ``201`` on add, ``200`` if the name was already on the watchlist or
+  refers to ``Public`` (system-managed), ``400`` on empty or
+  control-character names.  Existing GET stays byte-for-byte
+  compatible; downstream consumers (e.g. ``meshcore-gui`` clients,
+  ``domca.nl``) are unaffected.
+- **``tools/channel_injector``** — standalone CLI (stdlib-only) that
+  fetches one or more remote channel listings, computes the diff
+  against the current watchlist, and submits the missing channels via
+  the new POST endpoint, followed by a per-channel rescan over the
+  last 7 UTC days.  Exit codes ``0`` / ``1`` / ``2``; one-line summary
+  at WARNING level for cron-friendly logs.
+- **``install_script/channel_injector.cron.example``** — drop-in cron
+  entry showing the explicit ``.venv/bin/python`` invocation and a
+  reasonable default schedule.
+- **``install_script/install.sh``** — now also copies ``tools/`` to
+  the install dir when present, so the cron entry can ``cd`` there
+  and invoke ``python -m tools.channel_injector``.  Conditional on
+  the directory existing, so installing from an older tree without
+  ``tools/`` is unchanged.
+- **Documentation refresh** — ``docs/architecture.md`` (§3.3 folder
+  layout, §9 REST API endpoint table + new §9.4 watchlist-mutation
+  control-plane, new §12.5 out-of-process helper pattern in
+  ``tools/``), ``docs/fto.md`` (new UC-13 cron-driven seeding, new
+  §6.3 watchlist-mutation contract, §8.1 reference to the cron
+  example), ``docs/datadictionary.md`` (new §5.8 ``POST /api/v1/channels``
+  request and response shapes).  The 0.2.6 release-specific document
+  ``docs/ontwerp/ontwerp-0.2.6.md`` is intentionally left untouched.
+
+### Changed
+
+- **``register_routes(shared, rescan_manager, store=None)``** —
+  signature gained an optional trailing ``store`` keyword argument so
+  the new POST endpoint can reach the watchlist store without
+  detouring through ``SharedData``.  Default ``None`` keeps the
+  0.2.x two-argument callers working: when ``store`` is omitted the
+  POST endpoint is simply not registered.  ``main.py`` now passes
+  ``store=store``.
+- **Version bump** ``0.2.6`` → ``0.3.0`` (MINOR — additive
+  functionality, no breaking changes).
+
+### IMPACT
+
+- Operators can now point a cron job at an upstream listing and have
+  the watchlist self-update.  Adding the channel triggers
+  ``WatchlistStore``'s normal subscriber chain, so the decoder key
+  registry, the GUI, and ``state.json`` all pick up the new entry
+  without a service restart.
+- No changes to JSONL archive schema, no changes to existing REST
+  shapes, no new third-party dependencies.
+
+### RATIONALE
+
+The watchlist was UI-managed only.  Clients needing programmatic
+seeding (e.g. fleet syncing across multiple watchlist instances,
+discovery-driven channel rotation) had no clean entry point and were
+forced to either edit ``watchlist.json`` directly (race with the live
+``WatchlistStore``, no decoder key refresh) or re-implement the GUI
+flow.  An additive ``POST /api/v1/channels`` is the smallest possible
+hook that preserves CLAUDE.md's "single mutator" rule: the daemon is
+still the only writer, the new endpoint just exposes its existing
+``add()`` capability over HTTP.
+
 ## [0.2.6] - 2026-05-01
 
 Closes the half-refactor that 0.2.5 left behind: ``channel_name`` is

@@ -109,6 +109,13 @@ mkdir -p "$INSTALL_DIR"
 cp -r "$PROJECT_ROOT/meshcore_watchlist" "$INSTALL_DIR/"
 cp "$PROJECT_ROOT/requirements.txt" "$INSTALL_DIR/"
 
+# Optional: out-of-process helper scripts (channel_injector, …).
+# Copied only when present so older trees without tools/ keep
+# installing identically.
+if [[ -d "$PROJECT_ROOT/tools" ]]; then
+    cp -r "$PROJECT_ROOT/tools" "$INSTALL_DIR/"
+fi
+
 chown -R "$USER_NAME":"$USER_NAME" "$INSTALL_DIR"
 
 # ---- Runtime data directory ------------------------------------------------

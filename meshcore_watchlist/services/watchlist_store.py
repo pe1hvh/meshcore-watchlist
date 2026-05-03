@@ -51,6 +51,13 @@ from meshcore_watchlist.config import (
 
 WATCHLIST_VERSION = 1
 
+# Per ADR-007: a channel name accepted by meshcore-watchlist is a
+# UTF-8 string whose encoded length is at most 32 bytes — the size of
+# the Channel Name field in the MeshCore Companion Protocol's
+# CMD_SET_CHANNEL (0x20).  Names that do not fit in 32 UTF-8 bytes can
+# never be activated on a real device.
+CHANNEL_NAME_MAX_BYTES = 32
+
 
 def derive_key(name: str) -> bytes:
     """Derive the 16-byte channel secret from a channel name."""
@@ -190,6 +197,13 @@ class WatchlistStore:
         For any other channel, the leading ``#`` is enforced (added
         if missing).  Duplicates (case-sensitive name match) are
         rejected silently and return ``False``.
+
+        Names whose UTF-8 encoding exceeds
+        :data:`CHANNEL_NAME_MAX_BYTES` (32 bytes) are also rejected —
+        per ADR-007 and the MeshCore Companion Protocol, names that
+        do not fit in the on-wire Channel Name field cannot
+        correspond to a real channel.  Length is in **bytes**, not
+        codepoints (e.g. ``#café`` is 6 bytes, not 5).
         """
         name = name.strip()
         if not name:
@@ -200,6 +214,18 @@ class WatchlistStore:
             return True
         if not name.startswith("#"):
             name = "#" + name
+
+        # Enforce the protocol-bounded length (ADR-007).  We count
+        # bytes after enforcing the leading '#', so callers passing
+        # an unprefixed 32-byte name don't overshoot once we add the
+        # '#' on their behalf.
+        if len(name.encode("utf-8")) > CHANNEL_NAME_MAX_BYTES:
+            debug_print(
+                f"WatchlistStore: rejected '{name}' — "
+                f"{len(name.encode('utf-8'))} bytes UTF-8 exceeds "
+                f"{CHANNEL_NAME_MAX_BYTES} (ADR-007)"
+            )
+            return False
 
         with self._lock:
             for ch in self._channels:

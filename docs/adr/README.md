@@ -1,96 +1,98 @@
-# Architecture Decision Records — PE1HVH-projecten
+# Architecture Decision Records — PE1HVH projects
 
-Deze folder bevat de Architecture Decision Records (ADRs) voor de
-projecten van PE1HVH. Een ADR legt één architectuur- of ontwerpbesluit
-vast: wat is besloten, waarom, en wat de gevolgen zijn. Wie later in de
-code een vreemde keuze tegenkomt, leest hier waarom die keuze indertijd
-zo is gemaakt.
+This folder contains the Architecture Decision Records (ADRs) for the
+projects of PE1HVH. An ADR records one architecture or design decision:
+what was decided, why, and what the consequences are. Anyone who later
+encounters an unusual choice in the code reads here why that choice was
+made at the time.
 
-## Conventies
+## Conventions
 
-### Bestandsnamen
+### File names
 
-`ADR-NNN-korte-titel-met-streepjes.md`, met `NNN` een doorlopend
-volgnummer met drie cijfers, beginnend bij `001`. Nummers worden niet
-hergebruikt, ook niet als een ADR wordt vervangen of vervalt.
+`ADR-NNN-short-title-with-dashes.md`, with `NNN` a running serial
+number of three digits, starting at `001`. Numbers are not reused, not
+even when an ADR is superseded or withdrawn.
 
-### Statuswaarden
+### Status values
 
-| Status              | Betekenis                                                                                          |
-|---------------------|----------------------------------------------------------------------------------------------------|
-| **Voorgesteld**     | Concept, nog niet besloten. Kan vrij gewijzigd worden.                                            |
-| **Geaccepteerd**    | Besluit staat. Code en review houden zich eraan.                                                  |
-| **Vervangen**       | Door een nieuwer ADR vervangen. Bestand blijft staan, met verwijzing naar het opvolgende ADR.     |
-| **Vervallen**       | Niet vervangen, maar niet meer geldig (bijv. doordat een feature is geschrapt).                   |
+| Status           | Meaning                                                                                            |
+|------------------|----------------------------------------------------------------------------------------------------|
+| **Proposed**     | Draft, not yet decided. May be modified freely.                                                    |
+| **Accepted**     | Decision stands. Code and review hold to it.                                                       |
+| **Superseded**   | Replaced by a newer ADR. The file remains in place, with a reference to the succeeding ADR.        |
+| **Withdrawn**    | Not superseded, but no longer valid (e.g. because a feature has been removed).                     |
 
-Eenmaal *Geaccepteerd* wordt de inhoud niet meer aangepast. Wijziging
-van het besluit gebeurt via een nieuw ADR dat het oude *Vervangt*.
+Once **Accepted**, the content is no longer modified. Changing the
+decision happens via a new ADR that **Supersedes** the old one.
 
-### Datums
+### Dates
 
-Alle datums in ADRs (en breder, in alle PE1HVH-projecten) staan in
-ISO 8601-formaat: `YYYY-MM-DD`. Zie ADR-002.
+All dates in ADRs (and more broadly, in all PE1HVH projects) are in
+ISO 8601 format: `YYYY-MM-DD`. See ADR-002.
 
-### Auteur
+### Author
 
-Default-auteur is **PE1HVH (Hans)**. Als een derde een ADR voorstelt,
-staat de naam daar; het besluit blijft een PE1HVH-besluit en wordt
-expliciet als *Geaccepteerd* gemarkeerd voor het ingaat.
+The default author is **PE1HVH (Hans)**. If a third party proposes an
+ADR, that name appears there; the decision remains a PE1HVH decision
+and is explicitly marked **Accepted** before it takes effect.
 
 ### Template
 
-Nieuwe ADRs starten vanuit `ADR-template.md`. Kopieer het bestand,
-geef het volgende beschikbare nummer, en vul de zes hoofdstukken in.
-Een ADR met onvolledige hoofdstukken wordt niet *Geaccepteerd*.
+New ADRs start from `ADR-template.md`. Copy the file, give it the next
+available number, and fill in the six chapters. An ADR with incomplete
+chapters is not **Accepted**.
 
 ## Index
 
-| ID      | Titel                                                        | Scope                  | Status         |
-|---------|--------------------------------------------------------------|------------------------|----------------|
-| ADR-001 | `channel_name` is de stabiele identiteit van een kanaal      | meshcore-watchlist     | Geaccepteerd   |
-| ADR-002 | Datum- en tijdformaat is ISO 8601 met YYYY-MM-DD voor datums | Alle PE1HVH-projecten  | Geaccepteerd   |
-| ADR-003 | Standaard project folder layout                              | Alle PE1HVH-projecten  | Geaccepteerd   |
-| ADR-004 | Naming conventies — folders, namespaces, klassen, functies   | Alle PE1HVH-projecten  | Geaccepteerd   |
-| ADR-005 | SOLID en KISS als ontwerpprincipes                           | Alle PE1HVH-projecten  | Geaccepteerd   |
+| ID      | Title                                                          | Scope                  | Status     |
+|---------|----------------------------------------------------------------|------------------------|------------|
+| ADR-001 | `channel_name` is the stable identity of a channel             | meshcore-watchlist     | Accepted   |
+| ADR-002 | Date and time format is ISO 8601 with YYYY-MM-DD for dates     | All PE1HVH projects    | Accepted   |
+| ADR-003 | Standard project folder layout                                 | All PE1HVH projects    | Accepted   |
+| ADR-004 | Naming conventions — folders, namespaces, classes, functions   | All PE1HVH projects    | Accepted   |
+| ADR-005 | SOLID and KISS as design principles                            | All PE1HVH projects    | Accepted   |
+| ADR-006 | Language policy for documentation and project communication    | meshcore-watchlist     | Accepted   |
+| ADR-007 | Channel-name length and charset bounded by Companion Protocol  | meshcore-watchlist     | Accepted   |
 
-## Begrippenlijst
+## Glossary
 
-Termen die in ADRs voorkomen en niet vanzelfsprekend zijn:
+Terms appearing in ADRs that are not self-evident:
 
-- **Invariant** — een eigenschap die altijd waar moet blijven, ongeacht
-  welke operatie wordt uitgevoerd. ADR-001 stelt zo'n invariant vast:
-  `channel_name` is altijd de identiteit, op elk moment, in elk pad.
-- **Drop-in vervanging** — een nieuwe versie van een package die de
-  oude een-op-een vervangt: zelfde importpaden, zelfde installatieroute,
-  geen aanpassingen nodig in code die de package gebruikt.
-- **Shape (van een datastructuur of API-respons)** — de structuur:
-  welke velden, met welke types, op welke plek in de boom.
-- **Live tail** — het pad waarbij een binnenkomend packet (van de
-  radio, via meshcore-gui) direct door de pijplijn gaat: tailer leest
-  de JSONL-regel zoals `tail -f` dat doet, decoder ontcijfert,
-  shared-data slaat op.
-- **Rescan** — het opnieuw verwerken van eerder ontvangen, gearchiveerde
-  packets, bijvoorbeeld nadat een nieuwe key is toegevoegd of een
-  watchlist-wijziging een eerder onleesbaar bericht alsnog leesbaar
-  maakt.
-- **Fingerprint (van een bericht)** — een tuple van velden die samen
-  een logisch bericht uniek identificeren binnen het archief, gebruikt
-  voor deduplicatie tussen live-tail en rescan.
-- **idx** — de positie van een kanaal in de huidige watchlist-array,
-  een geheel getal beginnend bij 0. Vluchtig: verandert bij elke
-  watchlist-mutatie. Geen identiteit; zie ADR-001.
-- **PSR (PHP Standard Recommendations)** — door PHP-FIG vastgestelde
-  stijlnormen. Relevant in dit register: PSR-1 (basis-stijl), PSR-4
-  (autoloading), PSR-12 (uitgebreide stijl). Zie ADR-004.
-- **PEP 8** — de Python-stijlgids, *Style Guide for Python Code*.
-  Wijkt op functienaam-stijl af van de cross-language regel uit
-  ADR-004 (snake_case in plaats van camelCase). Geaccepteerde
-  uitzondering binnen Python.
-- **SOLID** — vijf objectgeoriënteerde ontwerpprincipes (Single
+- **Invariant** — a property that must always hold true, regardless of
+  the operation performed. ADR-001 establishes such an invariant:
+  `channel_name` is always the identity, at every moment, in every
+  path.
+- **Drop-in replacement** — a new version of a package that replaces
+  the old one-for-one: same import paths, same install route, no
+  changes needed in code that uses the package.
+- **Shape (of a data structure or API response)** — the structure:
+  which fields, with which types, in which place in the tree.
+- **Live tail** — the path on which an incoming packet (from the
+  radio, via meshcore-gui) goes directly through the pipeline: tailer
+  reads the JSONL line as `tail -f` would, decoder decrypts,
+  shared-data stores.
+- **Rescan** — reprocessing previously received, archived packets,
+  for example after a new key has been added or after a watchlist
+  change makes a previously unreadable message readable.
+- **Fingerprint (of a message)** — a tuple of fields that together
+  uniquely identify a logical message within the archive, used for
+  deduplication between live tail and rescan.
+- **idx** — the position of a channel in the current watchlist
+  array, an integer starting at 0. Volatile: changes on every
+  watchlist mutation. Not identity; see ADR-001.
+- **PSR (PHP Standard Recommendations)** — style standards set by
+  PHP-FIG. Relevant in this register: PSR-1 (basic style), PSR-4
+  (autoloading), PSR-12 (extended style). See ADR-004.
+- **PEP 8** — the Python style guide, *Style Guide for Python Code*.
+  Deviates on function-name style from the cross-language rule of
+  ADR-004 (snake_case instead of camelCase). Accepted exception
+  within Python.
+- **SOLID** — five object-oriented design principles (Single
   Responsibility, Open/Closed, Liskov Substitution, Interface
-  Segregation, Dependency Inversion). Zie ADR-005.
-- **KISS** — *Keep It Simple, Stupid.* De simpelste oplossing die het
-  probleem correct oplost wint. Zie ADR-005.
-- **YAGNI** — *You Aren't Gonna Need It.* Variant op KISS specifiek
-  gericht op het afwijzen van speculatieve features. Niet als eigen
-  principe vastgelegd; wordt door KISS gedekt.
+  Segregation, Dependency Inversion). See ADR-005.
+- **KISS** — *Keep It Simple, Stupid.* The simplest solution that
+  solves the problem correctly wins. See ADR-005.
+- **YAGNI** — *You Aren't Gonna Need It.* A variant of KISS aimed
+  specifically at rejecting speculative features. Not recorded as its
+  own principle; covered by KISS.

@@ -1,132 +1,131 @@
-# ADR-003: Standaard project folder layout
+# ADR-003: Standard project folder layout
 
-| Veld              | Waarde                                                        |
+| Field             | Value                                                         |
 |-------------------|---------------------------------------------------------------|
-| **Status**        | Geaccepteerd                                                  |
-| **Datum**         | 2026-05-01                                                    |
-| **Auteur**        | PE1HVH (Hans)                                                 |
-| **Scope**         | Alle PE1HVH-projecten (taal-onafhankelijk)                    |
-| **Vervangt**      | —                                                             |
-| **Vervangen door**| —                                                             |
+| **Status**        | Accepted                                                      |
+| **Date**          | 2026-05-01                                                    |
+| **Author**        | PE1HVH (Hans)                                                 |
+| **Scope**         | All PE1HVH projects (language-independent)                    |
+| **Supersedes**    | —                                                             |
+| **Superseded by** | —                                                             |
 
 ---
 
 ## 1. Context
 
-PE1HVH-projecten bestaan in meerdere talen (Python, PHP, JavaScript,
-incidenteel anders). Zonder een vaste afspraak over folderstructuur
-kreeg elk nieuw project zijn eigen layout: soms code in `src/`, soms
-in een package-directory direct onder de root, soms in `include/`,
-soms gemengd met de web-laag in dezelfde folder. Resultaat:
+PE1HVH projects exist in several languages (Python, PHP, JavaScript,
+occasionally others). Without a fixed agreement on folder structure,
+every new project ended up with its own layout: sometimes code in
+`src/`, sometimes in a package directory directly under the root,
+sometimes in `include/`, sometimes mixed with the web layer in the
+same folder. The result:
 
-- bij hervatten van een project na een paar maanden eerst zoeken
-  waar de code staat;
-- copy-paste van scripts of build-stappen tussen projecten werkt
-  niet zonder aanpassing;
-- AI-tooling die in het ene project getuned is, faalt in het volgende
-  doordat de aannames over folder-locaties niet kloppen.
+- when resuming a project after a few months, first hunting for where
+  the code lives;
+- copy-paste of scripts or build steps between projects fails without
+  adjustment;
+- AI tooling tuned for one project breaks in the next because the
+  assumptions about folder locations no longer hold.
 
-Een vaste layout kost weinig (één keer afspreken, daarna automatisch)
-en levert direct rust op.
+A fixed layout costs little (agreed once, automatic afterwards) and
+delivers immediate calm.
 
-## 2. Beslissing
+## 2. Decision
 
-Elk PE1HVH-project gebruikt deze top-level structuur:
+Every PE1HVH project uses this top-level structure:
 
 ```
 <project-root>/
-├── src/              # alle applicatie-code (default)
-│   └── …             # of: package-directory direct onder root,
-│                     #     voor talen waar dat de norm is (Python flat-layout)
-├── html/             # alleen placeholders / web-roots / thin entry-points
-│                     # geen applicatielogica
-├── docs/             # projectdocumentatie
-│   └── adr/          # Architecture Decision Records (zie ADR-template.md)
-├── tests/            # alle testcode, parallel aan src/
-├── README.md         # wat het project is en hoe je het draait
-├── CHANGELOG.md      # versiehistorie volgens Keep a Changelog
-└── <taal-config>     # composer.json, pyproject.toml, package.json, …
+├── src/              # all application code (default)
+│   └── …             # or: package directory directly under the root,
+│                     #     for languages where that is the norm
+│                     #     (Python flat-layout)
+├── html/             # placeholders / web roots / thin entry points only
+│                     # no application logic
+├── docs/             # project documentation
+│   └── adr/          # Architecture Decision Records (see ADR-template.md)
+├── tests/            # all test code, parallel to src/
+├── README.md         # what the project is and how to run it
+├── CHANGELOG.md      # version history per Keep a Changelog
+└── <language config> # composer.json, pyproject.toml, package.json, …
 ```
 
-**Vaste regels:**
+**Fixed rules:**
 
-- **Eén plek voor code.** Default `src/`. In talen met een sterke
-  conventie tegen een `src/`-wrapper (Python flat-layout met de
-  package direct onder de root) mag die conventie gevolgd worden,
-  mits het project dat consistent doet.
-- **`include/` als alternatief voor `src/`** is toegestaan voor
-  legacy- of klein-PHP-projecten waar `include/` historisch al in
-  gebruik was. Niet beide naast elkaar in hetzelfde project.
-- **`html/` is uitsluitend voor placeholders en de web-front.** Geen
-  business logic, geen database-queries, geen utility-functies. Een
-  `html/index.php` doet niets meer dan een entry-point uit `src/`
-  aanroepen.
-- **`docs/adr/`** is de vaste plek voor het ADR-register.
-- **`tests/`** loopt structureel parallel aan `src/`: `src/foo/bar.php`
-  heeft zijn test in `tests/foo/bar.test.php` (of de
-  taal-equivalent).
+- **One place for code.** Default `src/`. In languages with a strong
+  convention against a `src/` wrapper (Python flat-layout with the
+  package directly under the root), that convention may be followed,
+  provided the project does so consistently.
+- **`include/` as an alternative to `src/`** is permitted for legacy
+  or small PHP projects where `include/` was already historically in
+  use. Not both side-by-side in the same project.
+- **`html/` is exclusively for placeholders and the web front.** No
+  business logic, no database queries, no utility functions. An
+  `html/index.php` does no more than invoke an entry point from `src/`.
+- **`docs/adr/`** is the fixed location for the ADR register.
+- **`tests/`** runs structurally parallel to `src/`: `src/foo/bar.php`
+  has its test in `tests/foo/bar.test.php` (or the language
+  equivalent).
 
-## 3. Argumentatie
+## 3. Rationale
 
-Eén layout voor alle projecten betekent:
+One layout for all projects means:
 
-- Een nieuw project starten kost geen tijd aan structuur-keuzes.
-- De gebruiker (Hans) of een AI-assistent kan zonder uitleg in elk
-  project de juiste plek vinden.
-- Build- en deploy-scripts zijn portabel.
-- De scheiding `src/` vs `html/` dwingt af dat applicatielogica niet
-  per ongeluk in de web-root komt te staan (en daarmee onbedoeld
-  publiek toegankelijk).
+- Starting a new project costs no time on structure choices.
+- The user (Hans) or an AI assistant can find the right place in any
+  project without explanation.
+- Build and deploy scripts are portable.
+- The separation `src/` vs `html/` enforces that application logic
+  does not accidentally end up in the web root (and from there
+  unintentionally publicly accessible).
 
-`html/` als naam in plaats van `public/` of `www/` is een keuze die
-volgt uit bestaande PE1HVH-projecten (`pe1hvh.nl`, `domca.nl`); de
-naam is minder belangrijk dan dat hij vast staat.
+`html/` as the name instead of `public/` or `www/` is a choice that
+follows from existing PE1HVH projects (`pe1hvh.nl`, `domca.nl`); the
+name matters less than the fact that it is fixed.
 
-## 4. Gevolgen
+## 4. Consequences
 
-**Wat wordt makkelijker:**
+**What becomes easier:**
 
-- Elk nieuw project begint vanuit een vast skelet.
-- Cross-project tooling (linter-configuratie, CI-scripts, deploy-
-  recepten) werkt zonder per-project aanpassing.
+- Every new project starts from a fixed skeleton.
+- Cross-project tooling (linter configuration, CI scripts, deploy
+  recipes) works without per-project adjustment.
 
-**Wat wordt moeilijker:**
+**What becomes harder:**
 
-- Bestaande projecten die niet aan deze layout voldoen, vragen om
-  een eenmalige opruim-actie. Dat hoeft niet in één keer; het mag
-  gefaseerd, mits elk project op een gegeven moment conform is.
+- Existing projects that do not conform to this layout require a
+  one-time clean-up. That need not happen all at once; it may be
+  phased, provided every project is conformant at some point.
 
-**Wat moet afgedwongen worden:**
+**What must be enforced:**
 
-- Bij `git init` van een nieuw project: starten met een skelet dat
-  deze structuur heeft. Een `cookiecutter`- of vergelijkbaar
-  template is een zinvolle vervolgstap (eigen ADR waard als en
-  wanneer).
-- Code-review-check: niets in `html/` dat geen placeholder of
-  thin entry-point is.
-- README.md van elk project benoemt expliciet welke variant
-  gebruikt wordt (`src/`, package-flat, of `include/`) en waarom.
+- On `git init` of a new project: start from a skeleton that has this
+  structure. A `cookiecutter` or comparable template is a worthwhile
+  follow-up step (worth its own ADR if and when).
+- Code-review check: nothing in `html/` that is not a placeholder or
+  thin entry point.
+- The README.md of every project explicitly names which variant is in
+  use (`src/`, package-flat, or `include/`) and why.
 
-## 5. Overwogen alternatieven
+## 5. Alternatives considered
 
-**Alternatief A — Per project zelf de layout kiezen.** Afgewezen,
-want dat is precies de toestand die dit ADR oplost.
+**Alternative A — choose layout per project.** Rejected, because that
+is precisely the situation this ADR resolves.
 
-**Alternatief B — Strikt PSR-4 voor alles, ook niet-PHP.** Afgewezen,
-want PSR-4 is een PHP-specifieke standaard en past niet zonder
-verwringing op Python-flat-layout of op JavaScript-projecten met
-`package.json`-conventies.
+**Alternative B — strict PSR-4 for everything, including non-PHP.**
+Rejected, because PSR-4 is a PHP-specific standard and does not fit
+without distortion onto Python flat-layout or JavaScript projects with
+`package.json` conventions.
 
-**Alternatief C — Aparte top-level folder voor configuratie
-(`config/`).** Afgewezen voor nu — voegt complexiteit toe zonder
-duidelijk gewin in projecten van deze omvang. Kan in een eigen ADR
-heroverwogen worden als de praktijk daarom vraagt.
+**Alternative C — separate top-level folder for configuration
+(`config/`).** Rejected for now — adds complexity without clear gain
+in projects of this size. May be reconsidered in its own ADR if
+practice demands it.
 
-## 6. Referenties
+## 6. References
 
-- ADR-001 (channel_name als identiteit) — niet gerelateerd, maar
-  toont format voor een vergelijkbare scope-uitspraak.
-- PSR-4: PHP autoloading-standaard die `src/` als default oppert.
+- ADR-001 (channel_name as identity) — unrelated, but illustrates the
+  format for a comparable scope statement.
+- PSR-4: PHP autoloading standard that proposes `src/` as default.
 - Python Packaging User Guide, *Src layout vs flat layout*.
-- Bestaande PE1HVH-projecten met deze layout: `domca.nl`,
-  `pe1hvh.nl`.
+- Existing PE1HVH projects with this layout: `domca.nl`, `pe1hvh.nl`.

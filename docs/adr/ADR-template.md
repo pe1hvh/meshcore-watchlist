@@ -1,55 +1,55 @@
-# ADR-NNN: <Korte, beschrijvende titel>
+# ADR-NNN: <Short, descriptive title>
 
-| Veld              | Waarde                                                        |
+| Field             | Value                                                         |
 |-------------------|---------------------------------------------------------------|
-| **Status**        | Voorgesteld \| Geaccepteerd \| Vervangen \| Vervallen          |
-| **Datum**         | YYYY-MM-DD                                                    |
-| **Auteur**        | PE1HVH (Hans)                                                 |
-| **Scope**         | <package, subsysteem of project>                              |
-| **Vervangt**      | ADR-XXX (alleen invullen als van toepassing)                  |
-| **Vervangen door**| ADR-XXX (alleen invullen als van toepassing)                  |
+| **Status**        | Proposed \| Accepted \| Superseded \| Withdrawn                |
+| **Date**          | YYYY-MM-DD                                                    |
+| **Author**        | PE1HVH (Hans)                                                 |
+| **Scope**         | <package, subsystem, or project>                              |
+| **Supersedes**    | ADR-XXX (only fill in if applicable)                          |
+| **Superseded by** | ADR-XXX (only fill in if applicable)                          |
 
 ---
 
 ## 1. Context
 
-Wat is de situatie? Welk probleem, welke spanning of welke ervaring uit
-productie maakt deze beslissing nodig? Houd het feitelijk: wat is er
-gebeurd, wat is er gemeten, wat botst er met wat.
+What is the situation? Which problem, which tension, or which
+production experience makes this decision necessary? Keep it factual:
+what happened, what was measured, what is in conflict with what.
 
-## 2. Beslissing
+## 2. Decision
 
-Wat wordt besloten, in één tot drie zinnen. Geen bijzinnen met "tenzij"
-of "afhankelijk van". Een ADR met een onduidelijke beslissing is geen ADR.
+What is being decided, in one to three sentences. No subordinate
+clauses with "unless" or "depending on". An ADR with an unclear
+decision is not an ADR.
 
-## 3. Argumentatie
+## 3. Rationale
 
-Waarom dit besluit, en niet iets anders? Welke principes, feiten of
-metingen dragen het. Eén alinea is vaak genoeg.
+Why this decision, and not something else? Which principles, facts, or
+measurements support it. One paragraph is often enough.
 
-## 4. Gevolgen
+## 4. Consequences
 
-Wat verandert er door dit besluit:
+What changes as a result of this decision:
 
-- **Wat wordt makkelijker** — concreet, per onderdeel.
-- **Wat wordt moeilijker** — eerlijk, geen verstoppertje spelen met
-  trade-offs.
-- **Wat moet afgedwongen worden** — code-review-checks, lint-regels,
-  acceptatiecriteria, test-fixtures.
+- **What becomes easier** — concrete, per element.
+- **What becomes harder** — honest, no hide-and-seek with trade-offs.
+- **What must be enforced** — code-review checks, lint rules,
+  acceptance criteria, test fixtures.
 
-## 5. Overwogen alternatieven
+## 5. Alternatives considered
 
-Welke andere opties zijn serieus bekeken, en waarom afgevallen? Eén
-korte paragraaf per alternatief. Géén "we hebben ook gedacht aan X" zonder
-reden van afwijzing.
+Which other options were seriously examined, and why discarded? One
+short paragraph per alternative. No "we also thought of X" without a
+reason for rejection.
 
-## 6. Referenties
+## 6. References
 
-- Code-locaties die het besluit raken.
-- Andere ADRs (vervangen, gerelateerd).
-- Externe specs, RFC's, normen.
-- Eventuele commits / issues / changelog-entries.
+- Code locations affected by the decision.
+- Other ADRs (superseded, related).
+- External specs, RFCs, standards.
+- Any commits / issues / changelog entries.
 
 ---
 
-*Conventies voor dit ADR-register staan in `README.md` in deze folder.*
+*Conventions for this ADR register are in `README.md` in this folder.*

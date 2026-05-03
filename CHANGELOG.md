@@ -5,6 +5,53 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.5] - 2026-05-03
+
+Refinement on top of 0.3.4: a single-channel injector run now uses
+the cheaper scoped rescan endpoint instead of a full rescan.
+
+### Changed
+
+- **`tools/channel_injector/injector.py`** — the post-add rescan
+  branches on how many channels were actually added:
+    - exactly 1 added → `POST /api/v1/rescan/by-name` scoped to
+      that channel.  Only that channel's key is tried during the
+      decode pass — same cost as the pre-bug 1-channel cron run.
+    - 2+ added → `POST /api/v1/rescan` over the same UTC
+      day-window, covering every newly-added channel in one job
+      (unchanged from 0.3.4).
+  In both cases the run still submits exactly one rescan, so the
+  original 0.3.3 bug (one per channel → 409 storm) stays fixed.
+- **Version bump** `0.3.4` → `0.3.5` (PATCH — same semantics on
+  multi-channel runs, faster on single-channel runs; injector
+  public surface unchanged: `InjectorResult` shape, `summary_line()`
+  shape, `rescans_submitted` per-name list semantics, and
+  `WatchlistClient.{rescan_full, rescan_by_name}` all preserved).
+
+### IMPACT
+
+- Single-channel cron runs (the steady-state case once the initial
+  burst has settled) take the scoped path: one decode-pass per
+  archive line tries one key instead of N.  Measurable on a 426-
+  channel watchlist where a full rescan tries every key per line.
+- Multi-channel runs are byte-for-byte identical to 0.3.4 in
+  outcome: one full rescan, every newly-added channel covered.
+- `WatchlistClient.rescan_by_name` is back in the run loop's
+  fast-path, not just a public-surface leftover.  Its docstring
+  reflects this.
+
+### RATIONALE
+
+Per-feedback on 0.3.4: when only one channel is added, dispatching
+a full-watchlist rescan is unnecessary work — the existing scoped
+endpoint exists for exactly this case and is already exercised by
+the GUI.  The branch is a simple `len(result.added) == 1` check,
+no new abstractions, no polling loop.  The 2+ case still goes
+through `rescan_full` because chaining N scoped rescans would
+require either polling on `GET /api/v1/rescan/{job_id}` or a
+client-side queue, both of which are heavier than one full pass
+that the dedup absorbs.
+
 ## [0.3.4] - 2026-05-03
 
 Bugfix in the channel injector: a multi-channel run no longer wastes

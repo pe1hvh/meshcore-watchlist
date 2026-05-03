@@ -18,21 +18,25 @@ Flow per source URL:
 
    a. ``POST <api-base>/api/v1/channels?name=...``  →  add it.
 
-4. After the add-loop, **once**:
+4. After the add-loop, **once**, depending on how many channels
+   were added:
 
-   - ``POST <api-base>/api/v1/rescan?...``  →  single batched rescan
-     over the configured day-window covering every newly-added
-     channel.  The decoder tries every registered key (incl. the
-     freshly-added ones); existing-channel records are absorbed by
-     the message-archive fingerprint dedup so the full rescan does
-     no extra writes for them.
+   - exactly 1 added → ``POST <api-base>/api/v1/rescan/by-name?...``
+     scoped to that single new channel.  Cheaper: only that
+     channel's key is tried during the decode pass.
+   - 2 or more added → ``POST <api-base>/api/v1/rescan?...`` over
+     the configured day-window covering every newly-added channel
+     in one job.  The decoder tries every registered key (incl.
+     the freshly-added ones); existing-channel records are
+     absorbed by the message-archive fingerprint dedup so the
+     full rescan does no extra writes for them.
 
-The single batched rescan replaces the previous per-channel rescan
-pattern.  The server's :class:`RescanJobManager` is single-job by
-design (ontwerp 0.2.6 §9.2 — "geen queue"), so submitting one
-``rescan/by-name`` per added channel serialised to a 202 for the
-first and HTTP 409 ``rescan_busy`` for every subsequent one — only
-the first new channel ever got its archive decoded.
+Either way: exactly one rescan submit per run.  The previous
+implementation fired one per added channel; the server's
+:class:`RescanJobManager` is single-job by design (ontwerp
+0.2.6 §9.2 — "geen queue"), so the second submit and onward got
+HTTP 409 ``rescan_busy`` and only the first new channel ever got
+its archive decoded.
 
 A safety cap on adds per run prevents a misbehaving source from
 seeding the watchlist with hundreds of names in one go: once the
@@ -101,12 +105,14 @@ class InjectorResult:
             rejected (empty, non-hashtag-shaped, Public, control
             characters, …).
         rescans_submitted: Channel names covered by the post-add
-            batched rescan job.  Either equals :attr:`added` (one
-            rescan covers them all) or is empty if the rescan submit
-            itself failed (e.g. HTTP 409 ``rescan_busy`` because a
-            user-triggered rescan was already running).  The
-            per-name list shape is kept for backward compatibility
-            with the existing summary line and CLI output.
+            rescan job.  Equals :attr:`added` on success — whether
+            that was a single per-channel rescan (1 added) or a
+            full-window batched rescan (2+ added) — and is empty if
+            the rescan submit itself failed (e.g. HTTP 409
+            ``rescan_busy`` because a user-triggered rescan was
+            already running).  The per-name list shape is kept for
+            backward compatibility with the existing summary line
+            and CLI output.
         source_errors: ``(url, message)`` pairs for source URLs that
             could not be fetched or parsed.
         daemon_error: Set when the daemon itself was unreachable; in
@@ -343,14 +349,13 @@ class WatchlistClient:
 
         The dates are ISO ``YYYY-MM-DD`` UTC days, per the existing
         endpoint contract.  Returns ``(status, body)``; the daemon
-        uses 202 for "accepted".
+        uses 202 for "accepted", 409 for "rescan_busy".
 
         .. note::
-           The injector run loop no longer calls this — see
-           :meth:`rescan_full` and the module docstring.  The method
-           is kept on the public client surface for callers that
-           legitimately want a single per-channel rescan (tests,
-           ad-hoc tooling).
+           The injector run loop calls this exactly once per run,
+           and only when exactly one channel was added.  For 2+
+           added channels the loop calls :meth:`rescan_full`
+           instead — see the module docstring for the rationale.
         """
         qs = urllib.parse.urlencode({
             "channel_name": name,
@@ -572,47 +577,61 @@ def run_injector(
             result.skipped_invalid.append((name, f"unexpected_status: {status}"))
             continue
 
-    # 4. Batched rescan over the configured day-window, once, after
-    # every add has happened.  See module docstring for the full
-    # rationale; the short version is: the daemon's RescanJobManager
-    # is single-job by design (ontwerp 0.2.6 §9.2), so submitting one
-    # rescan/by-name per added channel only succeeds for the first
-    # and 409s for the rest.  One full-window submit covers every
-    # newly-added channel in a single job; existing-channel records
-    # are absorbed by message-archive fingerprint dedup downstream.
+    # 4. Rescan after the add-loop, once.  Endpoint depends on
+    # how many channels we actually added:
+    #
+    #   1 added  → POST /api/v1/rescan/by-name (scoped, only that
+    #              channel's key is tried during the decode pass)
+    #   2+ added → POST /api/v1/rescan         (one job, full
+    #              window — the decoder tries every registered key
+    #              including the freshly-added ones; existing-
+    #              channel records are absorbed by archive
+    #              fingerprint dedup downstream)
+    #
+    # In both cases: exactly ONE rescan submit per run.  The original
+    # bug was that the loop submitted one per added channel, hitting
+    # the daemon's single-job ceiling on every channel after the
+    # first; that ceiling is unchanged here, we just stop running
+    # into it.
     if not result.added:
         # Nothing new to decode — leave rescans_submitted empty.
         return result
 
+    scoped = (len(result.added) == 1)
+    if scoped:
+        scope_desc = f"per-channel rescan for {result.added[0]!r}"
+    else:
+        scope_desc = (
+            f"batched rescan covering {len(result.added)} new channel(s)"
+        )
+
     if dry_run:
         logger.info(
-            "[dry-run] would submit batched rescan over %s..%s "
-            "covering %d new channel(s): %s",
-            start_date, end_date, len(result.added),
-            ", ".join(result.added),
+            "[dry-run] would submit %s over %s..%s",
+            scope_desc, start_date, end_date,
         )
         result.rescans_submitted = list(result.added)
         return result
 
     try:
-        status, body = client.rescan_full(start_date, end_date)
+        if scoped:
+            status, body = client.rescan_by_name(
+                result.added[0], start_date, end_date,
+            )
+        else:
+            status, body = client.rescan_full(start_date, end_date)
     except urllib.error.HTTPError as exc:
         # 409 = rescan_busy.  Non-fatal: the channels are already
         # added; the rescan can be re-triggered manually (GUI or a
-        # subsequent injector run that finds nothing new to add but
-        # could be extended to re-submit — out of scope here).
-        # Leave rescans_submitted empty so the summary line tells
-        # the truth about what actually got submitted.
+        # subsequent injector run) once the slot is free.  Leave
+        # rescans_submitted empty so the summary line tells the
+        # truth about what actually got submitted.
         logger.warning(
-            "batched rescan over %d new channel(s) got HTTP %s: %s "
-            "— channels added, rescan not submitted",
-            len(result.added), exc.code, exc.reason,
+            "%s got HTTP %s: %s — channel(s) added, rescan not submitted",
+            scope_desc, exc.code, exc.reason,
         )
     except (urllib.error.URLError, OSError) as exc:
-        logger.warning(
-            "batched rescan over %d new channel(s) failed: %s",
-            len(result.added), exc,
-        )
+        logger.warning("%s failed: %s", scope_desc, exc)
     else:
         if status == 202:
             job_id = ""
@@ -621,18 +640,18 @@ def run_injector(
                 if isinstance(raw_jid, str):
                     job_id = raw_jid
             logger.info(
-                "rescan submitted (job=%s, window=%s..%s) "
-                "covering %d new channel(s)",
-                job_id or "<unknown>", start_date, end_date,
-                len(result.added),
+                "rescan submitted (job=%s, window=%s..%s) — %s",
+                job_id or "<unknown>", start_date, end_date, scope_desc,
             )
             # Per-name list semantics: the single job covers every
-            # newly-added channel.  Keeps summary_line() shape stable.
+            # newly-added channel (one for the scoped path, all of
+            # them for the full path).  Keeps summary_line() shape
+            # stable.
             result.rescans_submitted = list(result.added)
         else:
             logger.warning(
-                "unexpected status %s for batched rescan: %s",
-                status, body,
+                "unexpected status %s for %s: %s",
+                status, scope_desc, body,
             )
 
     return result

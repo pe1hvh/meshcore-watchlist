@@ -30,3 +30,6 @@
 
 # Example with two upstream sources and INFO logging:
 # */30 * * * * cd /opt/meshcore-watchlist && /opt/meshcore-watchlist/.venv/bin/python -m tools.channel_injector -v --source-url https://example.org/channels.json --source-url https://other.example/list.json >> /var/log/channel_injector.log 2>&1
+
+
+*/15 * * * * cd /opt/meshcore-watchlist && /opt/meshcore-watchlist/.venv/bin/python -m tools.channel_injector -v --source-url curl -s https://cornmeister.nl/api/channels >> /var/log/channel_injector.log 2>&1

@@ -10,6 +10,13 @@ Detection of file truncation / rotation: when the current file size is
 smaller than the stored cursor, the cursor is reset to 0.  Downstream
 deduplication (by ``message_hash``) absorbs the resulting one-time
 re-emit of the new file's contents.
+
+That claim only holds because :meth:`SharedData._load_from_archive`
+seeds its dedup sets from the *whole* archive.  Up to 0.3.5 it seeded
+them from the trailing 500 messages / 50 rxlog rows, so a reset that
+landed shortly after a restart re-appended most of the replayed window
+to the archive as duplicates.  Do not narrow that seeding again without
+first making the reset path itself idempotent.
 """
 
 import json

@@ -14,7 +14,7 @@ from pathlib import Path
 # Version
 # ---------------------------------------------------------------------------
 
-VERSION: str = "0.3.5"
+VERSION: str = "0.3.6"
 
 # ---------------------------------------------------------------------------
 # Paths
@@ -54,6 +54,14 @@ TAILER_POLL_SECONDS: float = 1.0
 
 MESSAGE_RETENTION_DAYS: int = 7
 RXLOG_RETENTION_DAYS: int = 7
+
+# Interval between retention sweeps of the watchlist's own archive.
+# Prior to 0.3.6 ``MessageArchive.cleanup_old_data()`` existed but was
+# never called from anywhere, so the archive grew without bound and
+# every startup paid a full parse of the whole history.  The sweep now
+# runs once at startup and every RETENTION_CLEANUP_INTERVAL_SECONDS
+# thereafter.
+RETENTION_CLEANUP_INTERVAL_SECONDS: float = 86400.0
 
 # ---------------------------------------------------------------------------
 # Public channel

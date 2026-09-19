@@ -8,6 +8,7 @@ Usage::
         [--api-base http://localhost:8083] \\
         [--rescan-days 7] \\
         [--timeout 10] \\
+        [--name-field name] [--no-hashtag] \\
         [--dry-run] [-v]
 
 Exit codes:
@@ -31,6 +32,7 @@ from tools.channel_injector import __version__
 from tools.channel_injector.injector import (
     DEFAULT_MAX_ADDS_PER_RUN,
     DEFAULT_MAX_SOURCE_BYTES,
+    DEFAULT_NAME_FIELD,
     fetch_and_inject,
 )
 
@@ -106,6 +108,27 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--name-field",
+        default=DEFAULT_NAME_FIELD,
+        metavar="FIELD",
+        help=(
+            "JSON field in each source entry that holds the channel "
+            "name (default: %(default)s).  Note that 'hash' on the "
+            "known sources holds the channel hash byte (e.g. '0x28'), "
+            "not a name."
+        ),
+    )
+    parser.add_argument(
+        "--no-hashtag",
+        action="store_true",
+        help=(
+            "The source delivers channel names without a leading "
+            "'#'; synthesise one instead of skipping such entries "
+            "with 'missing_hashtag_prefix'.  Off by default — names "
+            "that already start with '#' are never touched."
+        ),
+    )
+    parser.add_argument(
         "--dry-run",
         action="store_true",
         help="Compare only; do not POST anything to the daemon.",
@@ -167,10 +190,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         parser.error("--max-adds-per-run must be >= 1")
         return 1
 
+    name_field = args.name_field.strip()
+    if not name_field:
+        parser.error("--name-field must not be empty")
+        return 1
+
     log.info("channel_injector v%s starting (%d source(s), api=%s, dry_run=%s, "
-             "max_source_bytes=%d, max_adds_per_run=%d)",
+             "max_source_bytes=%d, max_adds_per_run=%d, name_field=%r, "
+             "add_hashtag=%s)",
              __version__, len(source_urls), args.api_base, args.dry_run,
-             args.max_source_bytes, args.max_adds_per_run)
+             args.max_source_bytes, args.max_adds_per_run, name_field,
+             args.no_hashtag)
 
     result = fetch_and_inject(
         source_urls=source_urls,
@@ -180,6 +210,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         dry_run=args.dry_run,
         max_source_bytes=args.max_source_bytes,
         max_adds_per_run=args.max_adds_per_run,
+        name_field=name_field,
+        add_hashtag=args.no_hashtag,
     )
 
     # Always emit a one-line summary at WARNING level so a quiet cron

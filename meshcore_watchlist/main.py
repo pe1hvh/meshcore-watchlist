@@ -28,14 +28,16 @@ watchlist position.
 
 from __future__ import annotations
 
+import threading
 from typing import Dict, List
 
-from nicegui import ui
+from nicegui import app as nicegui_app, ui
 
 from meshcore_watchlist.config import (
     HOST,
     PORT,
     PUBLIC_CHANNEL_SECRET,
+    RETENTION_CLEANUP_INTERVAL_SECONDS,
     VERSION,
     debug_print,
     is_public_channel_name,
@@ -218,6 +220,46 @@ class PacketPipeline:
 
 
 # ---------------------------------------------------------------------------
+# Retention scheduler
+# ---------------------------------------------------------------------------
+
+def _start_retention_thread(
+    shared: SharedData,
+    stop_event: threading.Event,
+) -> threading.Thread:
+    """Run the archive retention sweep on a fixed interval.
+
+    ``MessageArchive.cleanup_old_data()`` has existed since 0.2.4 but
+    had no caller, so ``MESSAGE_RETENTION_DAYS`` and
+    ``RXLOG_RETENTION_DAYS`` were configuration with no effect and the
+    archive grew without bound.  A plain daemon thread with an
+    interval wait is enough here; no scheduler abstraction is
+    warranted for one periodic call.
+
+    The startup sweep is not run here — :class:`SharedData` performs it
+    during construction, before it replays the archive, so the replay
+    already sees a bounded file.
+    """
+
+    def _loop() -> None:
+        while not stop_event.wait(RETENTION_CLEANUP_INTERVAL_SECONDS):
+            debug_print("Retention: starting scheduled archive cleanup")
+            shared.run_retention_cleanup()
+
+    thread = threading.Thread(
+        target=_loop,
+        name="retention-cleanup",
+        daemon=True,
+    )
+    thread.start()
+    debug_print(
+        f"Retention: sweep scheduled every "
+        f"{RETENTION_CLEANUP_INTERVAL_SECONDS}s"
+    )
+    return thread
+
+
+# ---------------------------------------------------------------------------
 # Bootstrap
 # ---------------------------------------------------------------------------
 
@@ -240,11 +282,30 @@ def main() -> None:
     rescanner = ArchiveRescanner(shared=shared, decoder=decoder, store=store)
     rescan_manager = RescanJobManager(rescanner, store=store)
 
+    # Retention sweep.  SharedData already ran one during construction;
+    # this schedules the repeats.
+    retention_stop = threading.Event()
+    _start_retention_thread(shared, retention_stop)
+
     # GUI
     build_dashboard(shared=shared, store=store, rescan_manager=rescan_manager)
 
     # Public REST API (/api/v1/...)
     register_routes(shared, rescan_manager=rescan_manager, store=store)
+
+    # Shutdown hook.  Order matters: stop the tailer first so no further
+    # entries land in the archive buffers, then flush those buffers.
+    # Without this a ``systemctl restart`` dropped every buffered row
+    # while state.json had already recorded the source bytes as
+    # consumed, making the loss permanent.
+    def _on_shutdown() -> None:
+        debug_print("Shutdown: stopping tailer and flushing archive")
+        retention_stop.set()
+        tailer.stop()
+        shared.flush_archive()
+        debug_print("Shutdown: archive flushed")
+
+    nicegui_app.on_shutdown(_on_shutdown)
 
     # NiceGUI run.  ``reload=False`` because we manage long-lived
     # background threads (the tailer) and reload would orphan them.

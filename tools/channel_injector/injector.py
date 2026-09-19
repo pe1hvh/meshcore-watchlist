@@ -10,6 +10,8 @@ Flow per source URL:
 
 1. ``GET <source-url>``  →  list of channels (the JSON shape produced
    by upstream listings, see :func:`extract_channel_names`).  The
+   channel name is read from the ``name`` field by default; a source
+   that carries it elsewhere is handled with ``--name-field``.  The
    response is read with a hard byte cap; over-large responses are
    rejected as a source error rather than read into memory in full.
 2. ``GET <api-base>/api/v1/channels``  →  current watchlist.
@@ -86,6 +88,13 @@ DEFAULT_MAX_SOURCE_BYTES = 1 * 1024 * 1024  # 1 MiB
 #: names is suspicious; this cap keeps an unintended burst from
 #: turning into hundreds of mutations.  Override via CLI.
 DEFAULT_MAX_ADDS_PER_RUN = 50
+
+#: Default JSON field holding the operator-visible channel name.
+#: Upstream listings observed so far put it in ``name`` (e.g.
+#: ``"#ping"``); ``hash`` on those same sources holds the channel
+#: hash *byte* (``"0x28"``), which is not a name.  Override via
+#: ``--name-field`` for a source that uses another key.
+DEFAULT_NAME_FIELD = "name"
 
 
 # ---------------------------------------------------------------------------
@@ -241,27 +250,51 @@ def _is_within_protocol_length(name: str) -> bool:
     """True iff ``name`` fits in the on-wire 32-byte UTF-8 channel field.
 
     Per ADR-007 / MeshCore Companion Protocol CMD_SET_CHANNEL.  The
-    measure is **bytes**, not codepoints.  We do not synthesise the
-    leading ``#`` here — input that lacks ``#`` is rejected upstream
-    by :func:`run_injector` before reaching this check, so what we
-    see is always the operator-visible name.
+    measure is **bytes**, not codepoints.  What reaches this check is
+    always the operator-visible name including its leading ``#`` —
+    either because the source delivered it that way, or because
+    :func:`extract_channel_names` synthesised it under
+    ``add_hashtag``.  The ``#`` therefore counts towards the 32
+    bytes, which matches what the daemon stores.
     """
     return len(name.encode("utf-8")) <= CHANNEL_NAME_MAX_BYTES
 
 
-def extract_channel_names(payload: object) -> List[str]:
+def extract_channel_names(
+    payload: object,
+    name_field: str = DEFAULT_NAME_FIELD,
+    add_hashtag: bool = False,
+) -> List[str]:
     """Pull channel names out of an upstream listing payload.
 
     Accepts the shape used by the upstream channel-listing service::
 
-        {"channels": [{"hash": "#ruche", "name": "#ruche", ...}, ...]}
+        {"channels": [{"key": "#ping", "name": "#ping",
+                       "hash": "0x28", ...}, ...]}
 
-    Per agreed contract (Iteratie A, keuze 4) the source already
-    delivers names with a leading ``#``; we do not synthesise one.
+    The name is read from ``name_field`` only.  Earlier revisions read
+    ``hash`` first and fell back to ``name``; on the sources actually
+    in use ``hash`` holds the channel hash *byte* (``"0x28"``), so
+    every entry yielded a hex string that was then rejected downstream
+    as ``missing_hashtag_prefix`` and nothing was ever added.  A
+    source that carries the name under another key is handled by
+    passing that key as ``name_field`` rather than by guessing.
 
     Falls back to a top-level list of objects if no ``channels`` key
     is present, so a service that returns a bare list still works.
-    The first non-empty of ``hash`` / ``name`` is used per entry.
+
+    Args:
+        payload: Parsed JSON from one source URL.
+        name_field: JSON key holding the operator-visible channel
+            name.  Defaults to ``name``.
+        add_hashtag: When True, a leading ``#`` is synthesised for
+            names that lack one.  Default False — the sources in use
+            already deliver ``#``-prefixed names, and silently fixing
+            up a source that unexpectedly stops doing so would hide a
+            real upstream change.  Names that already start with
+            ``#`` are left alone, so the flag is idempotent.  Public
+            detection is unaffected: :func:`_is_public` strips any
+            leading ``#`` before comparing.
 
     Returns:
         A de-duplicated list of names in input order.  Names that
@@ -282,10 +315,16 @@ def extract_channel_names(payload: object) -> List[str]:
     for entry in items:
         if not isinstance(entry, dict):
             continue
-        raw = entry.get("hash") or entry.get("name") or ""
+        raw = entry.get(name_field) or ""
         if not isinstance(raw, str):
             continue
         name = raw.strip()
+        if add_hashtag and name and not name.startswith("#"):
+            # Synthesised here rather than in the run loop so that
+            # dedup below sees the final form: a source mixing
+            # "ping" and "#ping" collapses to one candidate instead
+            # of two POSTs for the same channel.
+            name = "#" + name
         if not _is_safe_channel_name(name):
             continue
         if name in seen:
@@ -426,6 +465,8 @@ def run_injector(
     dry_run: bool = False,
     max_source_bytes: int = DEFAULT_MAX_SOURCE_BYTES,
     max_adds_per_run: int = DEFAULT_MAX_ADDS_PER_RUN,
+    name_field: str = DEFAULT_NAME_FIELD,
+    add_hashtag: bool = False,
 ) -> InjectorResult:
     """Execute one full injector pass.
 
@@ -448,6 +489,11 @@ def run_injector(
             ``--source-url`` candidates are skipped with reason
             ``max_adds_reached``.  Already-added channels still get
             their rescan submission.
+        name_field: JSON key in each source entry that holds the
+            channel name (default ``name``).
+        add_hashtag: When True, synthesise a leading ``#`` for source
+            names that lack one instead of skipping them with
+            ``missing_hashtag_prefix``.
 
     Returns:
         :class:`InjectorResult` describing what happened.
@@ -489,8 +535,13 @@ def run_injector(
             result.source_errors.append((url, msg))
             continue
 
-        names = extract_channel_names(payload)
-        logger.info("source %s yielded %d channel(s)", url, len(names))
+        names = extract_channel_names(
+            payload, name_field=name_field, add_hashtag=add_hashtag,
+        )
+        logger.info(
+            "source %s yielded %d channel(s) from field %r",
+            url, len(names), name_field,
+        )
         for n in names:
             if n not in wanted_set:
                 wanted_set.add(n)
@@ -509,7 +560,10 @@ def run_injector(
         if not name.startswith("#"):
             # Per agreed contract the source delivers hashtag-prefixed
             # names.  An entry without '#' is suspicious enough to
-            # surface as invalid rather than silently fixing it.
+            # surface as invalid rather than silently fixing it.  A
+            # source that legitimately omits the '#' is handled by
+            # running with --no-hashtag, which prefixes during
+            # extraction so this branch is never reached.
             result.skipped_invalid.append((name, "missing_hashtag_prefix"))
             logger.debug("skip %r: missing leading '#'", name)
             continue
@@ -665,6 +719,8 @@ def fetch_and_inject(
     dry_run: bool = False,
     max_source_bytes: int = DEFAULT_MAX_SOURCE_BYTES,
     max_adds_per_run: int = DEFAULT_MAX_ADDS_PER_RUN,
+    name_field: str = DEFAULT_NAME_FIELD,
+    add_hashtag: bool = False,
 ) -> InjectorResult:
     """Public entry point — see :func:`run_injector`."""
     return run_injector(
@@ -675,4 +731,6 @@ def fetch_and_inject(
         dry_run=dry_run,
         max_source_bytes=max_source_bytes,
         max_adds_per_run=max_adds_per_run,
+        name_field=name_field,
+        add_hashtag=add_hashtag,
     )

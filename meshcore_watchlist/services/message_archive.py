@@ -62,6 +62,11 @@ ARCHIVE_DIR = Path.home() / ".meshcore-watchlist" / "archive"
 # A constant is kept for the in-flight legacy reader/migrator only.
 LEGACY_ARCHIVE_VERSION = 1
 
+# Block size for the backwards tail reader (see ``_read_tail_lines``).
+# 64 KiB holds a few hundred typical rxlog rows, so the common case of
+# "give me the last 50 entries" is satisfied by one or two reads.
+TAIL_BLOCK_BYTES = 65536
+
 
 class MessageArchive:
     """Persistent storage for messages and RX log entries.
@@ -242,6 +247,75 @@ class MessageArchive:
                         continue
         except OSError as exc:
             debug_print(f"Archive: read error on {path.name}: {exc}")
+
+    # ------------------------------------------------------------------
+    # Tail reader — last N records without parsing the whole file
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _read_tail_lines(path: Path, max_lines: int) -> List[str]:
+        """Return at most *max_lines* complete trailing lines of *path*.
+
+        Reads backwards in :data:`TAIL_BLOCK_BYTES` blocks from EOF and
+        stops as soon as enough newlines have been seen, so the cost is
+        proportional to the requested tail rather than to the size of
+        the archive.
+
+        The first line in the accumulated buffer may be a fragment when
+        the loop stopped mid-file; the loop therefore collects strictly
+        more than *max_lines* newlines before stopping, and the final
+        slice discards that fragment.  Decoding uses ``errors="replace"``
+        so a multi-byte character split across a block boundary cannot
+        raise — it can only damage the fragment that is discarded.
+
+        Never raises; returns an empty list on any read error.
+        """
+        if max_lines <= 0 or not path.exists():
+            return []
+        buf = b""
+        try:
+            with path.open("rb") as f:
+                f.seek(0, os.SEEK_END)
+                pos = f.tell()
+                while pos > 0 and buf.count(b"\n") <= max_lines:
+                    read_size = min(TAIL_BLOCK_BYTES, pos)
+                    pos -= read_size
+                    f.seek(pos)
+                    buf = f.read(read_size) + buf
+        except OSError as exc:
+            debug_print(f"Archive: tail read error on {path.name}: {exc}")
+            return []
+
+        text = buf.decode("utf-8", errors="replace")
+        lines = [ln for ln in text.split("\n") if ln.strip()]
+        return lines[-max_lines:]
+
+    @staticmethod
+    def _parse_lines(lines: List[str]) -> List[Dict]:
+        """Parse JSONL lines into dicts, skipping malformed ones."""
+        out: List[Dict] = []
+        for line in lines:
+            try:
+                out.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+        return out
+
+    def load_recent_messages(self, limit: int) -> List[Dict]:
+        """Return the newest *limit* archived message rows, oldest first."""
+        with self._lock:
+            self._flush_messages()
+            return self._parse_lines(
+                self._read_tail_lines(self._messages_path, limit)
+            )
+
+    def load_recent_rxlog(self, limit: int) -> List[Dict]:
+        """Return the newest *limit* archived rxlog rows, oldest first."""
+        with self._lock:
+            self._flush_rxlog()
+            return self._parse_lines(
+                self._read_tail_lines(self._rxlog_path, limit)
+            )
 
     # ------------------------------------------------------------------
     # Insert

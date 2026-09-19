@@ -21,9 +21,16 @@ client vraagt het, de daemon doet het.
 4. Bestaande channels: skip (geen rescan).
 5. `Public` wordt nooit toegevoegd of gerescand (system-managed).
 
+De channel-naam wordt gelezen uit het veld `name` (aan te passen met
+`--name-field`). Let op: het veld `hash` bevat op de bekende bronnen
+de hash-**byte** van het kanaal (`0x28`), niet de naam.
+
 Channel-namen uit de bron komen al met `#`-prefix; entries zonder `#`
 worden geskipt met reden `missing_hashtag_prefix` (geen impliciete
-correctie). Control-characters (CR/LF, …) worden geweigerd.
+correctie). Levert een bron structureel namen zonder `#`, gebruik dan
+`--no-hashtag`: de injector zet de `#` er dan zelf voor. Namen die al
+met `#` beginnen blijven ongemoeid. Control-characters (CR/LF, …)
+worden geweigerd.
 
 ## Installatie
 
@@ -53,6 +60,8 @@ Uitvoeren als module:
 | `--timeout SEC` | nee | `10.0` | Timeout per HTTP-call. |
 | `--max-source-bytes BYTES` | nee | `1048576` (1 MiB) | Hard plafond op grootte van één source-response. Sluit een misbehavende of gecompromitteerde upstream uit. |
 | `--max-adds-per-run N` | nee | `50` | Hard plafond op het aantal toevoegingen per run. Sluit een burst van honderden namen uit als een bron gek doet. |
+| `--name-field FIELD` | nee | `name` | JSON-veld waaruit de channel-naam wordt gelezen. |
+| `--no-hashtag` | nee | uit | Bron levert namen zonder `#`; injector prefixt zelf. |
 | `--dry-run` | nee | uit | Vergelijk alleen; geen POSTs. |
 | `-v` / `-vv` | nee | WARNING | INFO / DEBUG-loggen. |
 
@@ -126,6 +135,7 @@ entry aan te raden — de injector zelf rouleert niet.
 | Max-adds-per-run cap bereikt | Resterende kandidaten skip met reden `max_adds_reached`; reeds toegevoegde channels behouden hun rescan; vlag `max_adds_reached=yes` in summary. |
 | `409 rescan_busy` | Channel is wél toegevoegd; rescan opnieuw bij volgende run. |
 | Channel al aanwezig | Skip (geen mutatie, geen rescan). |
-| Entry zonder `#` | Skip met reden `missing_hashtag_prefix`. |
+| Entry zonder `#` | Skip met reden `missing_hashtag_prefix` (tenzij `--no-hashtag`). |
+| Veld uit `--name-field` ontbreekt of is leeg | Entry wordt stil overgeslagen; de regel `source … yielded N channel(s) from field 'name'` toont `N=0`. |
 | Naam = `Public` (case-insensitive) | Skip met reden `public_is_system_managed`. |
 | Naam met CR/LF / control-chars | Skip lokaal én daemon weigert met 400 `invalid_name`. |

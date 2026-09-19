@@ -5,6 +5,113 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.6] - 2026-09-19
+
+Bugfix release: a restart no longer parses the whole archive, and the
+retention sweep that had no caller now runs.
+
+### Fixed
+
+- **Every restart parsed the entire archive.**
+  `SharedData._load_from_archive()` walked every line of
+  `*_messages.jsonl` and `*_rxlog.jsonl` through
+  `MessageArchive._iter_records()`, constructing a `Message` or
+  `RxLogEntry` per record, and then discarded all but the trailing
+  `MAX_MESSAGES` (500) and `MAX_RX_LOG` (50). On an archive that had
+  never been purged this made startup a multi-minute stall during
+  which nothing was ingested — which presented as the daemon
+  re-decoding its whole history. The display caches are now filled
+  from the archive tail via `MessageArchive.load_recent_messages()`
+  and `load_recent_rxlog()`.
+- **Retention was configuration with no effect.**
+  `MessageArchive.cleanup_old_data()` has existed since 0.2.4 but had
+  no caller anywhere in the codebase, so `MESSAGE_RETENTION_DAYS` and
+  `RXLOG_RETENTION_DAYS` never took effect and both archive files grew
+  without bound. The sweep now runs during `SharedData` construction
+  and thereafter on an interval.
+- **Duplicate archive rows after a truncation-triggered cursor
+  reset.** `JsonlTailer._process_file()` resets a cursor to 0 when the
+  source file shrinks — meshcore-gui rewrites its rxlog on its own
+  retention sweep — and its docstring claims downstream dedup absorbs
+  the resulting re-emit. That held only for a long-running process:
+  `_message_fingerprints` and `_rxlog_hashes` were seeded from the
+  display window (500 / 50 rows), so a reset shortly after a restart
+  re-appended almost the entire replayed window to the archive. Both
+  sets are now seeded from the complete archive via the existing
+  `load_all_message_fingerprints()` / `load_all_rxlog_hashes()` — the
+  same loaders `ArchiveRescanner` has always used for this reason.
+- **Buffered rows were lost on every shutdown.** `main()` had no
+  shutdown path: neither `tailer.stop()` nor `archive.flush()` was
+  ever called. A `systemctl restart` discarded up to `_batch_size`
+  (500) buffered rows while `state.json` had already recorded the
+  corresponding source bytes as consumed, so those packets were gone
+  for good.
+
+### Added
+
+- **`config.RETENTION_CLEANUP_INTERVAL_SECONDS`** (default `86400.0`)
+  — interval between retention sweeps of the watchlist's own archive.
+- **`MessageArchive.load_recent_messages(limit)` /
+  `load_recent_rxlog(limit)`** — bounded tail reads, backed by
+  `_read_tail_lines()`, which walks backwards from EOF in
+  `TAIL_BLOCK_BYTES` (64 KiB) blocks and stops once enough newlines
+  have been seen.
+- **`SharedData.run_retention_cleanup()` / `flush_archive()`** —
+  lifecycle entry points for the archive `SharedData` owns.
+- **Shutdown hook in `main()`** — a NiceGUI `app.on_shutdown` handler
+  that stops the tailer first, then flushes the archive.
+
+### IMPACT
+
+- Startup cost is now proportional to the retention window rather
+  than to total history. The tail read touches tens of kilobytes
+  instead of the whole file; the one remaining full pass is the
+  fingerprint seeding, bounded by the sweep that runs before it.
+- The archive stops growing without bound. The first start after
+  upgrading performs a one-shot purge of everything older than the
+  retention window, which on a long-running install can drop a large
+  fraction of both files.
+- A cursor reset that lands shortly after a restart no longer writes
+  duplicates. Verified against a synthetic 3000-row archive: 0.3.5
+  seeds 500 of 3000 fingerprints and re-appends an already-archived
+  row on re-emit; 0.3.6 seeds all 3000 and suppresses it.
+- Memory rises by the size of the two dedup sets, now covering the
+  retained archive instead of the display window. A long-running
+  0.3.5 process accumulated the same sets anyway — the change is that
+  they are correct immediately after a restart rather than after
+  hours of uptime.
+- No API, storage-format or identity changes. `channel_name` remains
+  the stable identity (ADR-001); nothing here touches `idx`.
+
+### RATIONALE
+
+The four defects are independent but share one root: startup treated
+the archive as small enough to read whole, and treated the display
+window as a sufficient record of what had already been seen. Neither
+held once the archive was allowed to grow unbounded, and the missing
+retention caller is why it was.
+
+Ordering inside `SharedData.__init__` is deliberate — sweep first,
+replay second — so the fingerprint scan is bounded by the retention
+window instead of by total history. The shutdown hook stops the
+tailer before flushing so no further rows can land in the buffers
+between the two calls.
+
+No new abstraction was introduced for the periodic sweep: a plain
+daemon `Thread` with an `Event.wait()` interval is sufficient for one
+periodic call, and a scheduler class would be the kind of unwarranted
+structure ADR-005 rules out. `SharedData` no longer reaches into
+`MessageArchive._iter_records` or `_messages_path` / `_rxlog_path`,
+so the four `noqa: SLF001` suppressions are gone with it.
+
+### Deploy
+
+`app.on_shutdown` firing on systemd's `SIGTERM` is NiceGUI-version
+dependent and was not verified here. After installing, restart with
+`MESHCORE_WATCHLIST_DEBUG=1` and confirm `Shutdown: archive flushed`
+appears in the log. If it does not, an explicit
+`signal.signal(SIGTERM, ...)` handler is needed alongside the hook.
+
 ## [0.3.5] - 2026-05-03
 
 Refinement on top of 0.3.4: a single-channel injector run now uses

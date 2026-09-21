@@ -316,8 +316,8 @@ with a newline):
 SHELL=/bin/sh
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
-# Daily at 03:43: stop service, purge archive as hans, start service again
-43 3 * * * root systemctl stop meshcore-watchlist.service && runuser -u hans -- /opt/meshcore-watchlist/.venv/bin/python /opt/meshcore-watchlist/tools/purge_archive.py --archive-dir /home/hans/.meshcore-watchlist/archive --days 7 >> /var/log/meshcore/purge_archive.log 2>&1; systemctl start meshcore-watchlist.service
+# Daily at 03:43: stop service, purge archive as <user>, start service again
+43 3 * * * root systemctl stop meshcore-watchlist.service && runuser -u <user> -- /opt/meshcore-watchlist/.venv/bin/python /opt/meshcore-watchlist/tools/purge_archive.py --archive-dir /home/<user>/.meshcore-watchlist/archive --days 7 >> /var/log/meshcore/purge_archive.log 2>&1; systemctl start meshcore-watchlist.service
 ```
 
 How the line behaves:
@@ -327,7 +327,7 @@ How the line behaves:
 - `; start` — the service is started again **regardless** of the purge
   result (including exit code 1 for insufficient space), so a failed
   purge never leaves the daemon down.
-- `runuser -u hans --` — the purge runs as the service user, so file
+- `runuser -u <user> --` — the purge runs as the service user, so file
   ownership stays correct. `--archive-dir` is passed explicitly because
   `$HOME` in root's cron environment is `/root`.
 - Cron does not support line continuation with `\`; keep the entry on a

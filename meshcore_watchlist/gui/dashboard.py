@@ -20,11 +20,16 @@ when the rescan reports +0 new messages.
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from typing import Dict, List, Optional, TYPE_CHECKING
 
 from nicegui import ui
 
-from meshcore_watchlist.config import VERSION, debug_print
+from meshcore_watchlist.config import (
+    GUI_TIMESTAMPS_LOCAL,
+    VERSION,
+    debug_print,
+)
 from meshcore_watchlist.core.shared_data import SharedData
 from meshcore_watchlist.services.archive_rescanner import (
     InvalidRescanWindow,
@@ -420,7 +425,7 @@ def _build_watchlist_panel(
 def _build_messages_panel():
     """Decoded GroupText messages — read-only table."""
     columns = [
-        {"name": "time", "label": "Time", "field": "time", "align": "left"},
+        {"name": "time", "label": _time_column_label(), "field": "time", "align": "left"},
         {"name": "channel_name", "label": "Channel", "field": "channel_name"},
         {"name": "sender", "label": "Sender", "field": "sender"},
         {"name": "text", "label": "Message", "field": "text", "align": "left"},
@@ -433,7 +438,7 @@ def _build_messages_panel():
 def _build_rxlog_panel():
     """Raw RX log — every packet, decoded or not."""
     columns = [
-        {"name": "time", "label": "Time", "field": "time"},
+        {"name": "time", "label": _time_column_label(), "field": "time"},
         {"name": "payload_type", "label": "Type", "field": "payload_type"},
         {"name": "hops", "label": "Hops", "field": "hops"},
         {"name": "snr", "label": "SNR", "field": "snr"},
@@ -448,9 +453,48 @@ def _build_rxlog_panel():
 # Row mappers
 # ---------------------------------------------------------------------------
 
+
+def _time_column_label() -> str:
+    """Header for the timestamp column, naming the zone being shown."""
+    if not GUI_TIMESTAMPS_LOCAL:
+        return "Date / time (UTC)"
+    local = datetime.now().astimezone().tzname() or "local"
+    return f"Date / time ({local})"
+
+def _display_time(obj) -> str:
+    """Render a row's timestamp as ``YYYY-MM-DD HH:MM:SS``.
+
+    Both halves come from ``timestamp_utc``, never one half from there
+    and the other from ``time``: ``time`` is meshcore-gui's local clock
+    with no date, ``timestamp_utc`` is UTC, and pairing them puts the
+    wrong date on every row between local midnight and UTC midnight.
+
+    Rendered in the machine's local timezone when
+    :data:`GUI_TIMESTAMPS_LOCAL` is set, which is the default: the
+    downstream collector at domca.nl renders local time, and the same
+    packet showing two different clock times on two screens is worse
+    than the dashboard differing from the archive.  The archive and the
+    REST API keep speaking UTC (ADR-002) and are untouched.
+
+    Falls back to the bare ``time`` string for rows archived before
+    0.2.4, which have no ``timestamp_utc`` at all.
+    """
+    raw = getattr(obj, "timestamp_utc", "") or ""
+    if raw:
+        try:
+            dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        except ValueError:
+            return getattr(obj, "time", "")
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        target = None if GUI_TIMESTAMPS_LOCAL else timezone.utc
+        return dt.astimezone(target).strftime("%Y-%m-%d %H:%M:%S")
+    return getattr(obj, "time", "")
+
+
 def _msg_to_row(m) -> Dict:
     return {
-        "time": getattr(m, "time", ""),
+        "time": _display_time(m),
         "channel_name": getattr(m, "channel_name", "") or f"ch{getattr(m, 'channel', '?')}",
         "sender": getattr(m, "sender", ""),
         "text": getattr(m, "text", ""),
@@ -462,7 +506,7 @@ def _msg_to_row(m) -> Dict:
 
 def _rx_to_row(r) -> Dict:
     return {
-        "time": getattr(r, "time", ""),
+        "time": _display_time(r),
         "payload_type": getattr(r, "payload_type", "?"),
         "hops": getattr(r, "hops", 0),
         "snr": getattr(r, "snr", 0),

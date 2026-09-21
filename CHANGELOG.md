@@ -5,6 +5,149 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.7] - 2026-09-19
+
+Corrects the approach taken in 0.3.6, and removes archive retention from
+the daemon entirely.
+
+### Fixed
+
+- **The retention sweep stalled the whole service.**
+  `MessageArchive.cleanup_old_data()` rewrites both archive files end to
+  end. On a 600 MB rxlog that is minutes of `json.loads` and
+  `json.dumps`, which holds the GIL and the archive lock; a
+  single-threaded asyncio event loop cannot answer a request while it
+  runs. 0.3.6 ran it on the startup path, before `ui.run()`. Moving it
+  to a background thread would not have helped, and did not: the
+  observed symptoms were a TCP connection accepted by the kernel and
+  never answered, an accept queue climbing above zero,
+  `watchlist_rxlog.jsonl` frozen while `watchlist_messages.jsonl` kept
+  being written (the rxlog flush queued behind the archive lock), and
+  `deactivating (stop-sigterm)` until systemd sent SIGKILL. The daemon
+  no longer applies retention at all; `purge_archive.py` does it from
+  cron, in its own process.
+- **Startup loaded the full archive dedup sets on every start.** 0.3.6
+  seeded `_message_fingerprints` and `_rxlog_hashes` from the whole
+  archive during `SharedData` construction, to make a possible later
+  replay safe. That is two full scans before `tailer.start()` is
+  reached, for an event that a restart never triggers — the tailer
+  resumes from its persisted cursor and has nothing to deduplicate. The
+  sets are seeded from the archive tail again, as in 0.3.5.
+- **A rewritten source file was mis-read rather than detected.**
+  `JsonlTailer._process_file()` recognised a rewritten source only via
+  `size < last_offset`. When meshcore-gui drops a day of old records and
+  roughly a day of new records has arrived, the file is the same size or
+  larger, the comparison is False, and the cursor silently points into
+  shifted content. The cursor now carries a SHA-1 of the last line
+  consumed; on a mismatch the tailer searches backwards from EOF for
+  that line and resumes immediately after it, re-emitting nothing.
+- **Buffered rows were lost on shutdown.** `main()` had no shutdown
+  path. A `systemctl restart` discarded up to `_batch_size` (500)
+  buffered rows while `state.json` had already recorded the
+  corresponding source bytes as consumed. A NiceGUI `app.on_shutdown`
+  hook now stops the tailer and then flushes, bounded by
+  `SHUTDOWN_FLUSH_TIMEOUT_SECONDS`.
+
+### Added
+
+- **`purge_archive.py`** — standalone retention tool, intended for cron.
+  `--report` counts rows and prints the timestamp range without writing;
+  `--dry-run` does the full pass without writing; `--days` sets the
+  window. Checks free space before rewriting and reports progress per
+  million rows. Unlike the in-daemon sweep it **keeps** rows with a
+  missing or unparseable `timestamp_utc` — `_is_newer_than` returns
+  False for both cases and the old caller read that as expired.
+  `--drop-undated` restores the old behaviour.
+- **`JsonlTailer(on_reset=...)`** — invoked with the file path
+  immediately before a file is replayed from byte 0, which happens only
+  when the last known line has genuinely rolled out of the source
+  retention window. `main()` wires it to `SharedData.seed_full_dedup()`.
+- **`state.json` version 2** — `{"offset": int, "last_line": "<sha1>"}`
+  per file. Version 1 (a bare int) is read transparently; a cursor
+  without a fingerprint falls back to the old size check until the next
+  line is consumed. No migration step.
+- **`config.TAILER_RESYNC_MAX_BYTES`** (default 64 MiB) — cap on the
+  backwards search before the tailer gives up and replays.
+- **`config.SHUTDOWN_FLUSH_TIMEOUT_SECONDS`** (default `15.0`).
+- **`config.GUI_TIMESTAMPS_LOCAL`** (default `True`).
+- **`Message.timestamp_utc` and `RxLogEntry.timestamp_utc`** — the
+  archive has stored this on every row since 0.2.4; it now survives the
+  round trip through the dataclass.
+- **`MessageArchive.load_recent_messages()` / `load_recent_rxlog()`** —
+  bounded tail reads, backed by a backwards block reader.
+- **`MessageArchive.cancel_cleanup()`** and a `timeout` on
+  `MessageArchive.flush()` — retained so an in-process caller of
+  `cleanup_old_data()` cannot wedge a shutdown, even though the daemon
+  no longer calls it.
+
+### Changed
+
+- **The GUI timestamp column shows `YYYY-MM-DD HH:MM:SS` in local time**
+  and the header names the zone, e.g. `Date / time (CEST)`. Both halves
+  come from `timestamp_utc`. Local rather than UTC so the dashboard
+  agrees with the downstream collector at domca.nl, which renders local
+  time; the archive and the REST API are unchanged and still speak UTC
+  per ADR-002. Rows archived before 0.2.4 have no `timestamp_utc` and
+  fall back to the bare `time` string.
+
+### Removed
+
+- The in-daemon retention scheduler, and
+  `SharedData.run_retention_cleanup()` with it.
+  `RETENTION_CLEANUP_INTERVAL_SECONDS` is gone;
+  `MESSAGE_RETENTION_DAYS` and `RXLOG_RETENTION_DAYS` remain as the
+  window `purge_archive.py` defaults to.
+
+### IMPACT
+
+- The event loop is never blocked by archive maintenance. Measured on a
+  clean build: three consecutive GUI requests in 39 ms, 8 ms and 8 ms,
+  and a SIGTERM handled in 0.1 s with all buffered rows flushed.
+- Startup returns to 0.3.5 cost. Nothing on that path reads more than
+  the archive tail.
+- The full dedup scan runs at most once per process, when a replay is
+  imminent, on the tailer thread.
+- Source rewrites that leave the file the same size or larger are now
+  handled. Every version up to and including 0.3.6 read straight past
+  them into shifted content.
+- **Retention will not happen until the cron job is installed.** The
+  archive grows until then. See `UPGRADE-0.3.7.md`.
+- No API or storage-format change. `channel_name` remains the stable
+  identity (ADR-001); `idx` is untouched. Adding `timestamp_utc` to the
+  dataclasses does not alter the public payload, because
+  `get_messages_payload` builds its items from the archive dicts.
+
+### RATIONALE
+
+0.3.6 attached an expensive guard to the wrong event. A replay is what
+needs full deduplication, and a replay is rare; a restart is common and
+needs none, because the persisted cursor already records where to
+resume.
+
+The better question was whether the replay needs to happen at all. It
+does not. If the tailer remembers which line it last consumed, it can
+locate that line again after a rewrite and carry on. The fingerprint is
+taken over the raw line bytes, so this makes no assumption about the
+record schema, the field names, or how meshcore-gui rotates — none of
+which can be verified from this repository. The search runs backwards
+because a caught-up tailer has its last line within a block or two of
+EOF; a forward scan would read the entire file in exactly that common
+case.
+
+On retention: periodic, I/O-bound, multi-minute work with no coupling to
+the running service does not belong inside it. Every attempt to place it
+there — startup, background thread, cancellable background thread — was
+a way of arranging a problem rather than removing it. A cron job in a
+separate process has none of the failure modes, and `purge_archive.py`
+can additionally be run with `--report` against a live service.
+
+### Deploy
+
+See `UPGRADE-0.3.7.md`. `verify_0_3_7.py` ships with this release: 21
+checks covering restart, rewrite-smaller, rewrite-larger, rolled-out
+cursor, version-1 state, and the timestamp rendering. Also set
+`TimeoutStopSec=30` in the unit — the implicit default is 90s.
+
 ## [0.3.6] - 2026-09-19
 
 Bugfix release: a restart no longer parses the whole archive, and the

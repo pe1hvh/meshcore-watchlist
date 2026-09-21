@@ -54,14 +54,15 @@ class SharedData:
         self.archive: Optional[MessageArchive] = MessageArchive(archive_id)
         debug_print(f"MessageArchive initialized for {archive_id}")
 
-        # Retention sweep first, replay second.  The sweep bounds both
-        # archive files to the configured retention window, which in
-        # turn bounds the fingerprint scan performed by
-        # :meth:`_load_from_archive`.
-        self.run_retention_cleanup()
+        # Guards the one-shot full dedup seeding (see
+        # :meth:`seed_full_dedup`), which the tailer triggers on a
+        # replay and which must run at most once per replay burst.
+        self._full_dedup_loaded: bool = False
 
         # Replay messages and rx-log from archive on startup so the GUI
         # is populated immediately (mirrors meshcore-gui behaviour).
+        # Cheap: the archive tail only.  Retention is applied out of
+        # process by purge_archive.py from cron, never by this daemon.
         self._load_from_archive()
 
     # ------------------------------------------------------------------
@@ -291,6 +292,9 @@ class SharedData:
             self.rx_log.clear()
             self._message_fingerprints.clear()
             self._rxlog_hashes.clear()
+            # The sets are about to be refilled from the tail only, so
+            # a later replay must be allowed to load the full sets again.
+            self._full_dedup_loaded = False
         # _load_from_archive acquires no lock itself (it appends only
         # during initial construction or here) but operates on the same
         # collections.  We hold no lock during the read so concurrent
@@ -305,86 +309,88 @@ class SharedData:
     # Archive lifecycle
     # ------------------------------------------------------------------
 
-    def run_retention_cleanup(self) -> None:
-        """Drop archive rows older than the configured retention window.
+    def seed_full_dedup(self) -> None:
+        """Load the complete archive dedup sets, once.
 
-        SharedData owns the :class:`MessageArchive` instance, so it owns
-        the entry point too; ``main`` schedules the repeat call.  Safe to
-        call while the tailer is running — ``cleanup_old_data`` flushes
-        and rewrites under the archive's own lock.
+        Called from :class:`JsonlTailer`'s ``on_reset`` hook, which
+        fires only when the tailer has lost its position in a source
+        file and is about to replay it from byte 0.  That replay is the
+        single case where the trailing display window is not enough to
+        recognise the daemon's own history.
+
+        Two full scans of the archive, so it is deliberately not on the
+        startup path.  Repeated calls after the first are no-ops: a
+        replay burst touches ``on_reset`` once per affected file, and
+        the live ingest path keeps both sets current from there on.
         """
-        if not self.archive:
+        if not self.archive or self._full_dedup_loaded:
             return
+        debug_print("Dedup: loading full archive sets ahead of a replay")
         try:
-            self.archive.cleanup_old_data()
+            messages = self.archive.load_all_message_fingerprints()
+            rxlog = self.archive.load_all_rxlog_hashes()
         except Exception as exc:
-            debug_print(f"Archive retention cleanup error: {exc}")
+            debug_print(f"Dedup: full seeding failed: {exc}")
+            return
+        with self.lock:
+            self._message_fingerprints |= messages
+            self._rxlog_hashes |= rxlog
+            self._full_dedup_loaded = True
+        debug_print(
+            f"Dedup: seeded {len(self._message_fingerprints)} message "
+            f"fingerprints, {len(self._rxlog_hashes)} rxlog hashes"
+        )
 
-    def flush_archive(self) -> None:
+    def flush_archive(self, timeout: Optional[float] = None) -> bool:
         """Write any buffered rows to disk.
 
         Called from the shutdown hook.  Without it a ``systemctl
         restart`` discarded up to ``_batch_size`` buffered rows while
         the tailer cursor had already advanced past the source lines
         they came from, so those packets were lost for good.
+
+        Args:
+            timeout: Maximum seconds to wait for the archive lock.
+
+        Returns:
+            ``True`` if the buffers were written.
         """
         if not self.archive:
-            return
+            return False
         try:
-            self.archive.flush()
+            return self.archive.flush(timeout=timeout)
         except Exception as exc:
             debug_print(f"Archive flush error: {exc}")
+            return False
 
     # ------------------------------------------------------------------
     # Internal
     # ------------------------------------------------------------------
 
     def _load_from_archive(self) -> None:
-        """Populate in-memory caches and dedup sets from the archive.
+        """Populate the in-memory display caches from the archive tail.
 
-        Two distinct concerns, with two distinct scopes:
-
-        *Display caches* (``messages``, ``rx_log``) only ever show the
-        newest :data:`MAX_MESSAGES` / :data:`MAX_RX_LOG` rows, so they
-        are filled from the archive **tail** via
+        This runs on the startup path, so it reads only the newest
+        :data:`MAX_MESSAGES` / :data:`MAX_RX_LOG` rows via
         :meth:`MessageArchive.load_recent_messages` /
-        :meth:`~MessageArchive.load_recent_rxlog`.  Up to 0.3.5 this
-        path parsed every line of both archive files and then discarded
-        all but the trailing window — on a never-purged archive that
-        turned every restart into a multi-minute stall that looked like
-        the daemon reprocessing its whole history.
+        :meth:`~MessageArchive.load_recent_rxlog`.  Up to 0.3.5 it
+        parsed every line of both archive files and discarded all but
+        that trailing window; 0.3.6 removed that but then seeded the
+        dedup sets from the whole archive instead, which put the same
+        cost back on the same path for a worse reason — the tailer knows
+        where it stopped, so a plain restart has nothing to deduplicate.
 
-        *Dedup sets* (``_message_fingerprints``, ``_rxlog_hashes``) must
-        cover the **whole** archive, not the display window.  Seeding
-        them from the trailing 500 / 50 rows (0.3.5 behaviour) left the
-        daemon unable to recognise its own history: when
-        :class:`JsonlTailer` resets a cursor to 0 after the source file
-        shrinks — meshcore-gui rewrites its rxlog on its own retention
-        sweep — the replayed window was re-appended to the archive
-        almost in full.  The rescanner already loads the complete sets
-        for exactly this reason; the live path now does the same.  The
-        cost is bounded because :meth:`run_retention_cleanup` runs
-        first.
+        The dedup sets are therefore seeded from the same trailing
+        window, and the full sets are loaded only when they are actually
+        needed: :meth:`seed_full_dedup`, invoked by the tailer's
+        ``on_reset`` hook immediately before a file is replayed from
+        byte 0.
 
         Errors are logged and non-fatal.
         """
         if not self.archive:
             return
 
-        # Dedup sets — full archive scope.
-        try:
-            self._message_fingerprints |= (
-                self.archive.load_all_message_fingerprints()
-            )
-        except Exception as exc:
-            debug_print(f"Archive replay (message fingerprints) error: {exc}")
-
-        try:
-            self._rxlog_hashes |= self.archive.load_all_rxlog_hashes()
-        except Exception as exc:
-            debug_print(f"Archive replay (rxlog hashes) error: {exc}")
-
-        # Display caches — trailing window only.
         from dataclasses import fields as _fields
 
         try:
@@ -392,9 +398,18 @@ class SharedData:
             for d in self.archive.load_recent_messages(self.MAX_MESSAGES):
                 kwargs = {k: v for k, v in d.items() if k in msg_field_names}
                 try:
-                    self.messages.append(Message(**kwargs))
+                    m = Message(**kwargs)
                 except TypeError:
                     continue
+                self.messages.append(m)
+                self._message_fingerprints.add(
+                    (
+                        m.message_hash or "",
+                        m.sender,
+                        m.text,
+                        m.channel_name,
+                    )
+                )
         except Exception as exc:
             debug_print(f"Archive replay (messages) error: {exc}")
 
@@ -403,15 +418,16 @@ class SharedData:
             for d in self.archive.load_recent_rxlog(self.MAX_RX_LOG):
                 kwargs = {k: v for k, v in d.items() if k in rx_field_names}
                 try:
-                    self.rx_log.append(RxLogEntry(**kwargs))
+                    r = RxLogEntry(**kwargs)
                 except TypeError:
                     continue
+                self.rx_log.append(r)
+                if r.message_hash:
+                    self._rxlog_hashes.add(r.message_hash)
         except Exception as exc:
             debug_print(f"Archive replay (rx_log) error: {exc}")
 
         debug_print(
             f"Loaded {len(self.messages)} msgs / "
-            f"{len(self.rx_log)} rx entries from archive "
-            f"({len(self._message_fingerprints)} message fingerprints, "
-            f"{len(self._rxlog_hashes)} rxlog hashes seeded)"
+            f"{len(self.rx_log)} rx entries from archive tail"
         )

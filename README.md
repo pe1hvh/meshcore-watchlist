@@ -211,6 +211,152 @@ for a sample crontab entry. Quick start:
     --source-url https://example.org/channels.json
 ```
 
+## Archive purge (`tools/purge_archive.py`)
+
+`tools/purge_archive.py` is a standalone, out-of-process retention purge
+for the archive in `~/.meshcore-watchlist/archive/`. It does the same
+job as the daemon's `MessageArchive.cleanup_old_data()`, but with a
+progress report, a free-space check before anything is written, and an
+optional de-duplication pass. Stdlib only; it runs in the daemon's own
+venv.
+
+It works on two files:
+
+```
+~/.meshcore-watchlist/archive/watchlist_messages.jsonl
+~/.meshcore-watchlist/archive/watchlist_rxlog.jsonl
+```
+
+### How it works
+
+The script has four modes. Only the last two write anything.
+
+| Mode | Command | Writes | Daemon |
+|------|---------|--------|--------|
+| Report | `--report` | no | may be running |
+| Dry run | `--dry-run` (optionally with `--dedupe`) | no | may be running |
+| Retention purge | *(no mode flag)* | yes | **stop first** |
+| De-duplication | `--dedupe` | yes | **stop first** |
+
+1. **Report** counts rows per file and prints the oldest/newest
+   `timestamp_utc`, the span in days, rows without a usable timestamp,
+   unparseable lines, and the number of duplicate rows by
+   `message_hash`.
+2. **Dry run** performs the full pass and prints what would be kept and
+   dropped.
+3. **Retention purge** keeps rows whose `timestamp_utc` is newer than
+   *now − `--days`* (UTC). Before writing, it checks that free space is
+   at least the combined size of both files (worst case: a full second
+   copy). If not, it refuses with exit code 1 and touches nothing. Each
+   file is then rewritten to `<file>.purge-tmp`, fsynced, and moved over
+   the original with an atomic rename.
+4. **De-duplication** (`--dedupe`) keeps the first row per
+   `message_hash` and drops later copies; retention is *not* applied in
+   this mode. Rows without a `message_hash` are always kept. Use it when
+   `--report` shows duplicate rows. Temporary file: `<file>.dedupe-tmp`.
+
+Differences from the daemon's own cleanup:
+
+- Rows with a missing or unparseable `timestamp_utc` (and unparseable
+  lines) are **kept** by default; the daemon drops them. Pass
+  `--drop-undated` to match the daemon's behaviour.
+- Free space is checked up front; the daemon's `OSError` path is silent
+  unless `MESHCORE_WATCHLIST_DEBUG=1`.
+- Progress is printed every million lines, so a large rx-log does not
+  look like a hang.
+
+Bytes appended to a file while a pass is running are carried over
+verbatim before the rename. That narrows the window, but the rewrite
+still replaces the file underneath the daemon, and the daemon's own
+cleanup rewrites the same files. Writing modes are therefore run with
+the service stopped.
+
+### Arguments
+
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `--archive-dir DIR` | `~/.meshcore-watchlist/archive` | Archive directory. Resolved from `$HOME` — pass it explicitly when running from cron or as another user. |
+| `--days N` | `7` | Retention window in days. Keep in line with `config.py`. |
+| `--report` | off | Count and print only. |
+| `--dry-run` | off | Full pass, no writes. |
+| `--dedupe` | off | De-duplicate on `message_hash` instead of applying retention. |
+| `--drop-undated` | off | Drop rows without a usable `timestamp_utc`. |
+
+Exit codes: `0` success, `1` not enough free space for the temporary
+copy, `2` archive directory does not exist.
+
+### Manual run
+
+```bash
+cd /opt/meshcore-watchlist
+PY=/opt/meshcore-watchlist/.venv/bin/python
+
+$PY tools/purge_archive.py --report          # safe while running
+$PY tools/purge_archive.py --dry-run         # safe while running
+
+sudo systemctl stop meshcore-watchlist.service
+$PY tools/purge_archive.py                   # or: --days 3, --dedupe
+sudo systemctl start meshcore-watchlist.service
+```
+
+Run the writing modes as the service user (not as root): the atomic
+rename leaves the new file owned by whoever ran the script, and a
+root-owned archive is no longer writable by the daemon.
+
+### Scheduling via cron (with service stop/start)
+
+Stopping and starting the service requires root, while the purge itself
+must run as the service user. Use a system cron file, which carries a
+user field, and drop privileges with `runuser` for the purge step.
+
+`/etc/cron.d/meshcore-watchlist-purge` (as root, mode `0644`, file ends
+with a newline):
+
+```cron
+SHELL=/bin/sh
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+# Daily at 03:43: stop service, purge archive as hans, start service again
+43 3 * * * root systemctl stop meshcore-watchlist.service && runuser -u hans -- /opt/meshcore-watchlist/.venv/bin/python /opt/meshcore-watchlist/tools/purge_archive.py --archive-dir /home/hans/.meshcore-watchlist/archive --days 7 >> /var/log/meshcore/purge_archive.log 2>&1; systemctl start meshcore-watchlist.service
+```
+
+How the line behaves:
+
+- `stop … && purge` — the purge only runs once the service has actually
+  stopped. If `stop` fails, nothing is rewritten.
+- `; start` — the service is started again **regardless** of the purge
+  result (including exit code 1 for insufficient space), so a failed
+  purge never leaves the daemon down.
+- `runuser -u hans --` — the purge runs as the service user, so file
+  ownership stays correct. `--archive-dir` is passed explicitly because
+  `$HOME` in root's cron environment is `/root`.
+- Cron does not support line continuation with `\`; keep the entry on a
+  single line.
+
+Choice of time: pick a minute that does not coincide with the channel
+injector (e.g. `17 * * * *`) or other `*/30` jobs. While the service is
+down, the injector gets no answer (`daemon_error=yes`) and any rescan
+in progress is interrupted; the next injector run picks things up
+again. The tailer resumes from its cursor in `state.json`, so traffic
+written by `meshcore-gui` during the stop is processed after the
+restart.
+
+For a periodic de-duplication pass, use the same line with `--dedupe`
+in place of `--days 7`, on a different schedule (e.g. weekly).
+
+Alternative without `/etc/cron.d`: put the line (without the `root`
+field) in root's crontab via `sudo crontab -e`.
+
+Check the result:
+
+```bash
+tail -n 20 /var/log/meshcore/purge_archive.log
+systemctl status meshcore-watchlist.service
+```
+
+For `/var/log/meshcore/purge_archive.log` a simple `logrotate.d` entry
+is advisable; the script does not rotate its own log.
+
 ## Configuration
 
 The watchlist is stored in `~/.meshcore-watchlist/watchlist.json` and

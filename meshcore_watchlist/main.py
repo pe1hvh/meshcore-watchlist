@@ -28,7 +28,7 @@ watchlist position.
 
 from __future__ import annotations
 
-import threading
+from datetime import datetime, timezone
 from typing import Dict, List
 
 from nicegui import app as nicegui_app, ui
@@ -37,7 +37,7 @@ from meshcore_watchlist.config import (
     HOST,
     PORT,
     PUBLIC_CHANNEL_SECRET,
-    RETENTION_CLEANUP_INTERVAL_SECONDS,
+    SHUTDOWN_FLUSH_TIMEOUT_SECONDS,
     VERSION,
     debug_print,
     is_public_channel_name,
@@ -53,6 +53,35 @@ from meshcore_watchlist.services.archive_rescanner import (
 )
 from meshcore_watchlist.services.jsonl_tailer import JsonlTailer
 from meshcore_watchlist.services.watchlist_store import WatchlistStore
+
+
+# ---------------------------------------------------------------------------
+# Timestamp recovery
+# ---------------------------------------------------------------------------
+
+# Field names that may carry an ISO-8601 instant on a source rxlog
+# record, in order of preference.  Same list ArchiveRescanner probes, so
+# the live path and the rescan path agree on what counts as the arrival
+# time for a given record.
+_TIMESTAMP_FIELDS = ("timestamp_utc", "timestamp", "received_at", "ts")
+
+
+def _record_timestamp_utc(rec: Dict) -> str:
+    """Return the record's arrival instant as ISO-8601, else ``now()``.
+
+    Never raises.  A record whose timestamp field is present but
+    unparseable is treated as absent.
+    """
+    for name in _TIMESTAMP_FIELDS:
+        value = rec.get(name)
+        if not isinstance(value, str) or not value:
+            continue
+        try:
+            datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            continue
+        return value
+    return datetime.now(timezone.utc).isoformat()
 
 
 # ---------------------------------------------------------------------------
@@ -149,6 +178,24 @@ class PacketPipeline:
         """Process one JSONL record from meshcore-gui's RX stream."""
         raw_payload = rec.get("raw_payload") or ""
 
+        # One instant for both the RxLogEntry and any Message derived
+        # from it, so the two rows never disagree.
+        #
+        # meshcore-gui writes an ISO-8601 ``timestamp_utc`` on every
+        # rxlog record alongside the local HH:MM:SS ``time`` field
+        # (verified 2026-09-19).  Use it: it is the actual arrival
+        # instant.  Up to 0.3.7 this path stamped ``now()``, which is
+        # within one TAILER_POLL_SECONDS while tailing but badly wrong
+        # for a replay — every replayed row landed on the replay moment,
+        # clustering thousands of packets on one second and breaking any
+        # downstream consumer that sorts or windows on the field.
+        # ArchiveRescanner has derived the original instant since 0.2.6;
+        # the live path now has a real source for it too.
+        #
+        # ``now()`` remains the fallback for a record that carries no
+        # parseable timestamp, which is what pre-0.2.4 sources produced.
+        arrival_utc = _record_timestamp_utc(rec)
+
         # Build the RxLogEntry first — always stored, regardless of
         # decode success.  Field set mirrors meshcore-gui::on_rx_log.
         rx_entry = RxLogEntry(
@@ -167,6 +214,7 @@ class PacketPipeline:
             payload_len=int(rec.get("payload_len", 0) or 0),
             route_type=rec.get("route_type", "") or "",
             packet_type_num=int(rec.get("packet_type_num", -1) or -1),
+            timestamp_utc=arrival_utc,
         )
         self._shared.add_rx_log(rx_entry)
 
@@ -210,6 +258,7 @@ class PacketPipeline:
             message_hash=decoded.message_hash,
         )
         msg.channel_name = decoded.channel_name
+        msg.timestamp_utc = arrival_utc
 
         self._shared.add_message(msg)
         debug_print(
@@ -217,46 +266,6 @@ class PacketPipeline:
             f"(idx={idx}), sender={decoded.sender!r}, "
             f"text={decoded.text[:40]!r}"
         )
-
-
-# ---------------------------------------------------------------------------
-# Retention scheduler
-# ---------------------------------------------------------------------------
-
-def _start_retention_thread(
-    shared: SharedData,
-    stop_event: threading.Event,
-) -> threading.Thread:
-    """Run the archive retention sweep on a fixed interval.
-
-    ``MessageArchive.cleanup_old_data()`` has existed since 0.2.4 but
-    had no caller, so ``MESSAGE_RETENTION_DAYS`` and
-    ``RXLOG_RETENTION_DAYS`` were configuration with no effect and the
-    archive grew without bound.  A plain daemon thread with an
-    interval wait is enough here; no scheduler abstraction is
-    warranted for one periodic call.
-
-    The startup sweep is not run here — :class:`SharedData` performs it
-    during construction, before it replays the archive, so the replay
-    already sees a bounded file.
-    """
-
-    def _loop() -> None:
-        while not stop_event.wait(RETENTION_CLEANUP_INTERVAL_SECONDS):
-            debug_print("Retention: starting scheduled archive cleanup")
-            shared.run_retention_cleanup()
-
-    thread = threading.Thread(
-        target=_loop,
-        name="retention-cleanup",
-        daemon=True,
-    )
-    thread.start()
-    debug_print(
-        f"Retention: sweep scheduled every "
-        f"{RETENTION_CLEANUP_INTERVAL_SECONDS}s"
-    )
-    return thread
 
 
 # ---------------------------------------------------------------------------
@@ -272,8 +281,20 @@ def main() -> None:
     decoder = PacketDecoder()
     pipeline = PacketPipeline(shared, decoder, store)
 
-    # Tailer
-    tailer = JsonlTailer(callback=pipeline.handle_entry)
+    # Tailer.  ``on_reset`` fires only when the tailer has lost its
+    # position in a source file and must replay it from byte 0 — the one
+    # case where the trailing dedup window is not enough.  A plain
+    # restart resumes from the persisted cursor and never reaches it.
+    def _on_tailer_reset(path) -> None:
+        debug_print(
+            f"Tailer reset on {path.name}: arming full-archive dedup"
+        )
+        shared.seed_full_dedup()
+
+    tailer = JsonlTailer(
+        callback=pipeline.handle_entry,
+        on_reset=_on_tailer_reset,
+    )
     tailer.start()
 
     # Rescanner: runs on demand via the REST endpoint or the GUI
@@ -281,11 +302,6 @@ def main() -> None:
     # state.json cursors.
     rescanner = ArchiveRescanner(shared=shared, decoder=decoder, store=store)
     rescan_manager = RescanJobManager(rescanner, store=store)
-
-    # Retention sweep.  SharedData already ran one during construction;
-    # this schedules the repeats.
-    retention_stop = threading.Event()
-    _start_retention_thread(shared, retention_stop)
 
     # GUI
     build_dashboard(shared=shared, store=store, rescan_manager=rescan_manager)
@@ -300,10 +316,15 @@ def main() -> None:
     # consumed, making the loss permanent.
     def _on_shutdown() -> None:
         debug_print("Shutdown: stopping tailer and flushing archive")
-        retention_stop.set()
+        # Stop the tailer first so no further rows land in the archive
+        # buffers, then flush them.  The flush is bounded: a shutdown
+        # that cannot finish is worse than one that drops a batch, and
+        # the bound sits well inside systemd's default TimeoutStopSec.
         tailer.stop()
-        shared.flush_archive()
-        debug_print("Shutdown: archive flushed")
+        if shared.flush_archive(timeout=SHUTDOWN_FLUSH_TIMEOUT_SECONDS):
+            debug_print("Shutdown: archive flushed")
+        else:
+            debug_print("Shutdown: archive flush timed out; buffers dropped")
 
     nicegui_app.on_shutdown(_on_shutdown)
 

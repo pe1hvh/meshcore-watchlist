@@ -29,7 +29,8 @@ class Message:
     """A channel message or direct message (DM).
 
     Attributes:
-        time:          Formatted timestamp (HH:MM:SS).
+        time:          Formatted timestamp (HH:MM:SS, local, no date).
+        timestamp_utc: Full ISO-8601 UTC instant, or "" when unknown.
         sender:        Display name of the sender.
         text:          Message body.
         channel:       Channel index, or ``None`` for a DM.
@@ -56,6 +57,15 @@ class Message:
     path_names: List[str] = field(default_factory=list)
     message_hash: str = ""
     channel_name: str = ""
+    # Full ISO-8601 UTC instant for this row.  ``time`` carries only
+    # HH:MM:SS in meshcore-gui's local rendering, which cannot be dated
+    # and cannot be compared across a midnight boundary.  The archive
+    # has stored this alongside every row since 0.2.4; from 0.3.7 it
+    # survives the round trip through the dataclass so the GUI can show
+    # a date (ADR-002).  Never combine the date from this field with the
+    # clock from ``time``: one is UTC, the other is local, and the pair
+    # is wrong for the offset every night.
+    timestamp_utc: str = ""
 
     @staticmethod
     def from_dict(d: dict) -> "Message":
@@ -80,6 +90,7 @@ class Message:
             path_names=d.get("path_names", []),
             message_hash=d.get("message_hash", ""),
             channel_name=d.get("channel_name", ""),
+            timestamp_utc=d.get("timestamp_utc", "") or "",
         )
 
     # -- Timestamp helper ------------------------------------------------
@@ -295,7 +306,8 @@ class RxLogEntry:
     """A single RX log entry from the radio.
 
     Attributes:
-        time:         Formatted timestamp (HH:MM:SS).
+        time:         Formatted timestamp (HH:MM:SS, local, no date).
+        timestamp_utc: Full ISO-8601 UTC instant, or "" when unknown.
         snr:          Signal-to-noise ratio (dB).
         rssi:         Received signal strength (dBm).
         payload_type: Packet type identifier.
@@ -321,6 +333,8 @@ class RxLogEntry:
     payload_len: int = 0        # Payload length (bytes)
     route_type: str = ""        # "F" (flood) or "D" (direct)
     packet_type_num: int = -1   # Numeric packet type (0-15)
+    # See Message.timestamp_utc — same field, same caveat.
+    timestamp_utc: str = ""
 
 
 # ---------------------------------------------------------------------------

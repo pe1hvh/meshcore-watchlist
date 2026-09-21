@@ -67,6 +67,11 @@ LEGACY_ARCHIVE_VERSION = 1
 # "give me the last 50 entries" is satisfied by one or two reads.
 TAIL_BLOCK_BYTES = 65536
 
+# How often the retention sweep checks whether it has been cancelled.
+# Small enough that a shutdown is not noticeably delayed, large enough
+# that the check costs nothing against the per-record JSON work.
+CLEANUP_CANCEL_CHECK_EVERY = 5000
+
 
 class MessageArchive:
     """Persistent storage for messages and RX log entries.
@@ -78,6 +83,14 @@ class MessageArchive:
     def __init__(self, device_id: str) -> None:
         self._address = device_id
         self._lock = threading.Lock()
+
+        # Set to abort an in-flight retention sweep.  The sweep holds
+        # ``_lock`` for the whole rewrite, which on a large archive is
+        # minutes; without a way to abort it, a SIGTERM arriving during
+        # the sweep left the shutdown flush blocked on the lock until
+        # systemd's TimeoutStopSec fired a SIGKILL — losing both the
+        # sweep and the buffered rows it was supposed to protect.
+        self._cancel_cleanup = threading.Event()
 
         # Sanitize address for filename
         safe_name = (
@@ -344,6 +357,7 @@ class MessageArchive:
                 "time": msg.time,
                 "timestamp_utc": (
                     timestamp_utc
+                    or msg.timestamp_utc
                     or datetime.now(timezone.utc).isoformat()
                 ),
                 "sender": msg.sender,
@@ -383,6 +397,7 @@ class MessageArchive:
                 "time": entry.time,
                 "timestamp_utc": (
                     timestamp_utc
+                    or entry.timestamp_utc
                     or datetime.now(timezone.utc).isoformat()
                 ),
                 "snr": entry.snr,
@@ -476,10 +491,43 @@ class MessageArchive:
         self._flush_messages()
         self._flush_rxlog()
 
-    def flush(self) -> None:
-        """Public flush — acquires lock and writes everything pending."""
-        with self._lock:
+    def cancel_cleanup(self) -> None:
+        """Abort an in-flight retention sweep as soon as it notices.
+
+        Returns immediately; the sweep drops its temporary file and
+        releases the lock at its next checkpoint.  The archive itself is
+        never left half-written, because the sweep only ever replaces
+        the real file by an atomic rename at the very end.
+        """
+        self._cancel_cleanup.set()
+
+    def flush(self, timeout: Optional[float] = None) -> bool:
+        """Public flush — acquires lock and writes everything pending.
+
+        Args:
+            timeout: Maximum seconds to wait for the archive lock.
+                ``None`` waits indefinitely.  The shutdown path passes a
+                bound so a stuck holder cannot keep the service in
+                ``stop-sigterm`` until systemd kills it.
+
+        Returns:
+            ``True`` if the buffers were written, ``False`` if the lock
+            could not be acquired within *timeout*.
+        """
+        if timeout is None:
+            with self._lock:
+                self._flush_all()
+            return True
+        if not self._lock.acquire(timeout=timeout):
+            debug_print(
+                f"Archive: flush gave up after {timeout}s waiting for the lock"
+            )
+            return False
+        try:
             self._flush_all()
+        finally:
+            self._lock.release()
+        return True
 
     # ------------------------------------------------------------------
     # Retention cleanup
@@ -492,18 +540,21 @@ class MessageArchive:
         cleanup is a one-shot full rewrite: read the .jsonl, filter
         out expired entries, write to a temp .jsonl, atomic rename.
         """
+        self._cancel_cleanup.clear()
         with self._lock:
             self._flush_all()
-            self._cleanup_jsonl(
+            if not self._cleanup_jsonl(
                 self._messages_path,
                 MESSAGE_RETENTION_DAYS,
                 kind="messages",
-            )
-            self._cleanup_jsonl(
+            ):
+                return
+            if not self._cleanup_jsonl(
                 self._rxlog_path,
                 RXLOG_RETENTION_DAYS,
                 kind="rxlog",
-            )
+            ):
+                return
             self._total_messages = self._count_lines(self._messages_path)
             self._total_rxlog = self._count_lines(self._rxlog_path)
 
@@ -512,17 +563,35 @@ class MessageArchive:
         path: Path,
         retention_days: int,
         kind: str,
-    ) -> None:
-        """Rewrite *path*, dropping records older than *retention_days*."""
+    ) -> bool:
+        """Rewrite *path*, dropping records older than *retention_days*.
+
+        Returns ``False`` if the sweep was cancelled or failed, in which
+        case *path* is left exactly as it was.
+        """
         if not path.exists():
-            return
+            return True
         cutoff = datetime.now(timezone.utc) - timedelta(days=retention_days)
         tmp = path.with_suffix(path.suffix + ".tmp")
         kept = 0
         dropped = 0
+        seen = 0
         try:
             with tmp.open("w", encoding="utf-8") as out:
                 for rec in self._iter_records(path):
+                    seen += 1
+                    if seen % CLEANUP_CANCEL_CHECK_EVERY == 0:
+                        if self._cancel_cleanup.is_set():
+                            debug_print(
+                                f"Archive: cleanup of {kind} cancelled after "
+                                f"{seen:,} rows; {path.name} left untouched"
+                            )
+                            out.close()
+                            try:
+                                tmp.unlink()
+                            except OSError:
+                                pass
+                            return False
                     if self._is_newer_than(rec.get("timestamp_utc"), cutoff):
                         out.write(json.dumps(rec, ensure_ascii=False))
                         out.write("\n")
@@ -538,13 +607,14 @@ class MessageArchive:
                 tmp.unlink()
             except OSError:
                 pass
-            return
+            return False
 
         if dropped:
             debug_print(
                 f"Archive: cleanup removed {dropped} old {kind} "
                 f"(retained: {kept})"
             )
+        return True
 
     # ------------------------------------------------------------------
     # Utilities

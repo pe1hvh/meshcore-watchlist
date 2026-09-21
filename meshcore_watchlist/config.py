@@ -14,7 +14,7 @@ from pathlib import Path
 # Version
 # ---------------------------------------------------------------------------
 
-VERSION: str = "0.3.6"
+VERSION: str = "0.3.8"
 
 # ---------------------------------------------------------------------------
 # Paths
@@ -48,6 +48,26 @@ HOST: str = os.environ.get("MESHCORE_WATCHLIST_HOST", "0.0.0.0")
 
 TAILER_POLL_SECONDS: float = 1.0
 
+# Upper bound on the backwards search the tailer performs when it finds
+# its source file rewritten.  The last consumed line is normally within
+# a few kilobytes of EOF, so this only caps the pathological case: if
+# the line is not found within this many bytes the tailer gives up and
+# replays the file from the start.
+TAILER_RESYNC_MAX_BYTES: int = 64 * 1024 * 1024
+
+# Upper bound on how long the shutdown hook waits for the archive lock
+# before giving up and letting the process exit.  Must stay well inside
+# systemd's TimeoutStopSec (90s by default) so the service always stops
+# cleanly rather than being SIGKILLed.
+SHUTDOWN_FLUSH_TIMEOUT_SECONDS: float = 15.0
+
+# Render GUI timestamps in the machine's local timezone rather than UTC.
+# The archive and the REST API both speak UTC (ADR-002) and are not
+# affected; this only changes what the dashboard displays, so it matches
+# the downstream collector's local rendering instead of showing the same
+# packet two hours apart on two screens.
+GUI_TIMESTAMPS_LOCAL: bool = True
+
 # ---------------------------------------------------------------------------
 # Retention (mirrors meshcore-gui defaults)
 # ---------------------------------------------------------------------------
@@ -55,13 +75,14 @@ TAILER_POLL_SECONDS: float = 1.0
 MESSAGE_RETENTION_DAYS: int = 7
 RXLOG_RETENTION_DAYS: int = 7
 
-# Interval between retention sweeps of the watchlist's own archive.
-# Prior to 0.3.6 ``MessageArchive.cleanup_old_data()`` existed but was
-# never called from anywhere, so the archive grew without bound and
-# every startup paid a full parse of the whole history.  The sweep now
-# runs once at startup and every RETENTION_CLEANUP_INTERVAL_SECONDS
-# thereafter.
-RETENTION_CLEANUP_INTERVAL_SECONDS: float = 86400.0
+# Retention is NOT applied by the daemon.  ``cleanup_old_data()`` rewrites
+# both archive files end to end; on a 600 MB rxlog that is minutes of
+# json.loads/json.dumps, which holds the GIL and the archive lock and
+# leaves the NiceGUI event loop unable to answer a single request.  0.3.6
+# ran it on the startup path and 0.3.7 tried a background thread — both
+# stalled the service, because the work does not belong in this process
+# at all.  Run ``purge_archive.py`` from cron instead; these two values
+# are the window it defaults to.
 
 # ---------------------------------------------------------------------------
 # Public channel
